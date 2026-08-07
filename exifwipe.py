@@ -256,7 +256,7 @@ except ImportError:
     pillow_heif = None
 
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 __author__ = "loucas"
 __github__ = "loucass"
 __license__ = "MIT"
