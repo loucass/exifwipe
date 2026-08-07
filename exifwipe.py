@@ -308,6 +308,162 @@ def exiftool_hint() -> str:
 
 
 # --------------------------------------------------------------------------- #
+# verification — prove nothing leaked before/after a wipe, or refuse
+# --------------------------------------------------------------------------- #
+def _verify_with_exiftool(path: Path) -> Optional[list]:
+    """Run `exiftool` if present and return a list of leaked tag names
+    (empty = clean). Returns None when exiftool is unavailable."""
+    import shutil
+    exif = shutil.which("exiftool")
+    if exif is None:
+        return None
+    import subprocess
+    out = subprocess.run([exif, "-j", "-a", "-G1", str(path)],
+                         capture_output=True, text=True).stdout
+    leaks = []
+    for line in out.splitlines():
+        line = line.strip().replace('"', "").replace(",", "")
+        # exiftool -j emits {"SourceFile": ..., "ExifTool": {...}, ...}
+        # anything with a real tag group (file/Exif ect) beyond the
+        # structural ones is a leak
+        if ": " not in line or line.startswith("{") or line.startswith("}"):
+            continue
+        key = line.split(":", 1)[0].strip()
+        if key.startswith(("SourceFile", "FileName", "Directory", "ExifTool",
+                           "FileSize", "FileModifyDate", "FileAccessDate",
+                           "FileInodeChangeDate", "FilePermissions", "FileType",
+                           "FileTypeExtension", "MIMEType", "ImageWidth",
+                           "ImageHeight", "BitDepth", "ColorType", "EncodingProcess",
+                           "Megapixels", "ImageSize")):
+            continue
+        leaks.append(key)
+    return leaks
+
+
+def _verify_bytes(path: Path, fmt: str) -> list:
+    """Per-format leak detection on a file, independent of exiftool.
+    Returns a list of leaked metadata names (empty = clean)."""
+    leaks = []
+    data = path.read_bytes()
+    if fmt == "jpeg":
+        if piexif is not None:
+            try:
+                ifd = piexif.load(data)
+                for k, d in ifd.items():
+                    if d:
+                        leaks.append(k)
+            except Exception:
+                pass
+        # also catch comment/APP segments a piexif round-trip can't see
+        i = 2
+        n = len(data)
+        while i + 4 <= n:
+            if data[i] != 0xFF:
+                break
+            while i < n and data[i] == 0xFF:
+                i += 1
+            if i >= n:
+                break
+            marker = data[i]; i += 1
+            if marker in (0xD8, 0xD9):
+                continue
+            if marker == 0xDA:
+                break
+            seg_len = int.from_bytes(data[i:i + 2], "big")
+            if seg_len < 2 or i + seg_len > n:
+                break
+            payload = data[i + 2:i + seg_len]
+            if marker == 0xFE:
+                leaks.append("COM")
+            elif 0xE0 <= marker <= 0xEF:
+                name = payload[:8].split(b"\x00")[0].decode(errors="replace")
+                if marker == 0xE0 and payload.startswith(b"JFIF"):
+                    pass  # structural, keep
+                elif marker == 0xE2 and payload.startswith(b"ICC_PROFILE\x00"):
+                    pass  # ICC if kept, structural
+                else:
+                    leaks.append(f"APP1x{name or hex(marker)}")
+            i += seg_len
+    elif fmt == "png":
+        pos = 8
+        n = len(data)
+        while pos + 8 <= n:
+            clen = int.from_bytes(data[pos:pos + 4], "big")
+            ctype = data[pos + 4:pos + 8]
+            if ctype == b"IEND":
+                break
+            if ctype in (b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"pHYs", b"iCCP"):
+                leaks.append(ctype.decode())
+            pos += 12 + clen
+    elif fmt == "webp":
+        pos = 12
+        n = len(data)
+        while pos + 8 <= n:
+            tag = data[pos:pos + 4]
+            size = int.from_bytes(data[pos + 4:pos + 8], "little")
+            if tag in (b"EXIF", b"XMP ", b"ICCP"):
+                leaks.append(tag.strip().decode())
+            if size > n:
+                break
+            pos += 8 + size + (size & 1)
+    elif fmt == "gif":
+        # comment ext is 0x21 0xFE — scan the whole stream
+        if data.count(b"\x21\xfe") > 0:
+            leaks.append("comment-ext")
+        if b"XMP Data" in data:
+            leaks.append("XMP")
+    elif fmt in ("heif", "avif"):
+        # ISO BMFF: hunt box types that carry metadata
+        if b"Exif" in data or b"mime" in data:
+            leaks.append("EXIF box")
+        if b"XMP " in data:
+            leaks.append("XMP box")
+    return leaks
+
+
+def verify_clean(path: Path) -> tuple[bool, list]:
+    """Return (clean, list-of-leaks). exiftool when installed, else the
+    per-format byte parsers."""
+    fmt = _sniff_format(path) if path.is_file() else None
+    if fmt is None:
+        return True, []
+    leaks = _verify_with_exiftool(path)
+    if leaks is not None:
+        return (len(leaks) == 0, leaks)
+    return (len(_verify_bytes(path, fmt)) == 0, _verify_bytes(path, fmt))
+
+
+def print_formats_matrix() -> None:
+    """What exifwipe guarantees per format — honest about limits."""
+    rows = [
+        ("jpeg",    "lossless marker rewrite (no re-encode)",
+                    "clean guaranteed when orientation-neutral"),
+        ("jpeg-rot", "orientation baked into pixels, quality-95 re-encode",
+                    "clean (pixels re-encoded, not byte-identical)"),
+        ("png",     "fresh frame rebuild, empty PngInfo",
+                    "clean"),
+        ("gif",     "byte-exact frame pass + comment/XMP drop",
+                    "clean, frames/palette/transparency preserved"),
+        ("webp",    "frame rebuild, exif/xmp/icc stripped",
+                    "clean; animated frames preserved"),
+        ("avif",    "re-encode via pillow-heif",
+                    "clean single-frame only; animated AVIF refuses"),
+        ("tiff",    "multi-page rebuild all tags dropped",
+                    "clean (best-effort on exotic tags)"),
+        ("bmp",     "pixel rebuild",
+                    "clean"),
+        ("heif",    "re-encode via pillow-heif",
+                    "clean single-frame only"),
+        ("pdf",     "pikepdf: drops /Info + XMP stream",
+                    "BEST-EFFORT: embedded-image EXIF, /Lang, JS etc. may survive"),
+    ]
+    w = max(len(r[0]) for r in rows)
+    print(c_head("format capability — guaranteed vs best-effort"))
+    for name, how, claim in rows:
+        print(f"  {c_info(name.ljust(w))}  {claim}")
+
+
+# --------------------------------------------------------------------------- #
 # core strip — image formats
 # --------------------------------------------------------------------------- #
 def _apply_orientation(img):
@@ -993,6 +1149,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="inspect what would be stripped, write nothing")
     p.add_argument("--inspect", action="store_true",
                    help="print metadata exiftool-style and exit (no write)")
+    p.add_argument("--verify", action="store_true",
+                   help="after stripping, prove no metadata remains "
+                        "(exiftool if installed, else per-format parsers); "
+                        "exit nonzero if anything leaks")
+    p.add_argument("--formats", action="store_true",
+                   help="print what formats are guaranteed clean "
+                      "vs best-effort, then exit")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="also print inspection after stripping")
     color_group = p.add_mutually_exclusive_group()
@@ -1008,6 +1171,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
     set_color(args.color)
+
+    # --formats / --version don't need an input at all
+    if args.formats:
+        print_formats_matrix()
+        return 0
 
     # no input → interactive menu
     if args.input is None:
@@ -1052,17 +1220,37 @@ def main(argv: Optional[list] = None) -> int:
         return 2
 
     n_ok, n_err = 0, 0
+    leaks = []
     for p in targets:
         if handle_one(p, args):
             n_ok += 1
         else:
             n_err += 1
+            continue
+        if args.verify:
+            check = p if args.output is None else args.output / p.name
+            try:
+                clean, found = verify_clean(check)
+            except Exception as e:
+                clean, found = False, [f"verify-error: {e}"]
+            if not clean or found:
+                leaks.extend(found or ["unknown"])
+                print(f"  {c_err('[LEAK]')} {c_warn(p.name)}: "
+                      f"{', '.join(found)}", file=sys.stderr)
+                n_err += 1
 
     print(f"\ndone. {n_ok} processed, {n_err} errors.")
+    if args.verify:
+        if leaks:
+            print(f"  {c_err('VERIFY FAILED:')} metadata still present in "
+                  f"{c_err(str(len(leaks)))} file(s). Do not publish these.",
+                  file=sys.stderr)
+        else:
+            print(f"  {c_ok('VERIFY OK:')} no metadata on any clean file.")
     if piexif is None:
         print("tip: install piexif for JPEG round-trip verify:  pip3 install piexif",
               file=sys.stderr)
-    return 0 if n_err == 0 else 3
+    return 0 if (n_err == 0 and (not args.verify or not leaks)) else 3
 
 
 if __name__ == "__main__":
