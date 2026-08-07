@@ -588,10 +588,11 @@ def _tiff_inventory(data: bytes, keep_icc: bool = False,
 
 def _tiff_protected_regions(data: bytes, bo: str, magic: int) -> list:
     """Byte ranges that must never be overwritten as tag *values*: the
-    file header and every reachable IFD block (count + entries + next
-    pointer). A hostile file can point a tag's value offset at its own
-    structure — blanking there would silently destroy the file. The
-    surgery refuses the file instead."""
+    file header, every reachable IFD block (count + entries + next
+    pointer) AND the pixel strip/tile ranges (StripOffsets/ByteCounts).
+    A hostile file can point a tag's value offset at its own structure
+    or at pixels — blanking there would silently destroy the file or
+    its photo. The surgery refuses the file instead."""
     entry, ifd_cnt, ent_cnt, off_size, header = _tiff_layout(bo, magic)
     regions = [(0, header)]
     ifd0 = int.from_bytes(data[header - off_size:header], bo)
@@ -607,6 +608,7 @@ def _tiff_protected_regions(data: bytes, bo: str, magic: int) -> list:
         regions.append((off, min(off + ifd_cnt + count * entry + off_size,
                                  len(data))))
         p = off + ifd_cnt
+        strips_off, strips_cnt = [], []
         for _ in range(count):
             if p + entry > len(data):
                 break
@@ -614,17 +616,38 @@ def _tiff_protected_regions(data: bytes, bo: str, magic: int) -> list:
             typ = int.from_bytes(data[p + 2:p + 4], bo)
             cnt = int.from_bytes(data[p + 4:p + 4 + ent_cnt], bo)
             vfield = p + 4 + off_size
-            if tag == 0x014A and typ in (3, 4, 9, 13):   # SubIFDs
-                for i in range(min(cnt, 256)):
-                    so = int.from_bytes(data[vfield + i * off_size:
-                                             vfield + (i + 1) * off_size], bo)
+            tsize = _TYPE_SIZE.get(typ)
+            if tsize is None:
+                p += entry
+                continue
+            nbytes = cnt * tsize
+            if nbytes <= off_size:      # inline value/array in the entry
+                base = vfield
+            else:                        # external array behind an offset
+                addr = int.from_bytes(data[vfield:vfield + off_size], bo)
+                if addr + nbytes > len(data):
+                    p += entry
+                    continue
+                base = addr
+            vals = [int.from_bytes(
+                data[base + i * tsize:base + (i + 1) * tsize], bo)
+                for i in range(min(cnt, 256))]
+            if tag == 0x014A:            # SubIFDs — walk them
+                for so in vals:
                     if so:
                         queue.append(so)
-            elif tag in (0x8769, 0x8825):                # EXIF / GPS IFD
+            elif tag in (0x8769, 0x8825):  # EXIF / GPS targets
                 tgt = int.from_bytes(data[vfield:vfield + off_size], bo)
                 if tgt:
                     queue.append(tgt)
+            elif tag == 0x0111:          # StripOffsets
+                strips_off.extend(v for v in vals if v)
+            elif tag == 0x0117:          # StripByteCounts
+                strips_cnt.extend(v for v in vals if v)
             p += entry
+        for so, sc in zip(strips_off, strips_cnt):
+            if so + sc <= len(data):
+                regions.append((so, so + sc))
         if p + off_size <= len(data):
             nxt = int.from_bytes(data[p:p + off_size], bo)
             if nxt:

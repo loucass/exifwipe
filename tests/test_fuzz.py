@@ -73,6 +73,32 @@ def test_tiff_surgery_fuzz_invariants(tmp_path):
     assert time.monotonic() - t0 < 30, "fuzz battery took too long (hang?)"
 
 
+def test_hostile_value_offset_into_pixels_refused(tmp_path):
+    """A tag value offset pointing at the pixel strip must be refused.
+    The surgery protects StripOffsets/StripByteCounts ranges too — not
+    just the IFD structure — so a hostile file can't trick the wipe
+    into blanking the photo itself."""
+    pixel = b"\x01\x02\x03" * 64        # 192 bytes of "pixels"
+    body = bytearray()
+    body += (3).to_bytes(2, "little")    # IFD0 entry count
+    # Make (0x010F), ASCII, count 7, value offset -> pixel start (hostile)
+    body += (0x010F).to_bytes(2, "little") + (2).to_bytes(2, "little")
+    body += (7).to_bytes(4, "little") + (50).to_bytes(4, "little")
+    # StripOffsets (0x0111), LONG, count 1, inline = 50
+    body += (0x0111).to_bytes(2, "little") + (4).to_bytes(2, "little")
+    body += (1).to_bytes(4, "little") + (50).to_bytes(4, "little")
+    # StripByteCounts (0x0117), LONG, count 1, inline = 192
+    body += (0x0117).to_bytes(2, "little") + (4).to_bytes(2, "little")
+    body += (1).to_bytes(4, "little") + (len(pixel)).to_bytes(4, "little")
+    body += (0).to_bytes(4, "little")    # next IFD
+    data = b"II\x2a\x00" + (8).to_bytes(4, "little") + bytes(body) + pixel
+    assert data[50:50 + len(pixel)] == pixel     # pixel region at 50
+    assert exifwipe._tiff_structure_ok(data, "little", 42)
+    # Make's value offset lands on protected pixel data -> refused, and
+    # the pixels survive untouched
+    assert exifwipe._tiff_strip_lossless(data) is None
+
+
 def test_tiff_walker_never_hangs_on_hostile_counts(tmp_path):
     """A giant entry-count field must not make the walker iterate forever."""
     base = bytearray(cr2_fixture(tmp_path / "h.cr2").read_bytes())
