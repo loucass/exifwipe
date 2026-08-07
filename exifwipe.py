@@ -1979,10 +1979,32 @@ def prompt_input(label: str) -> str:
         return ""
 
 
+def _clear_screen() -> None:
+    """Clear the terminal before re-rendering the menu (ANSI). No-op
+    when output is piped, so redirects and the test suite stay clean."""
+    try:
+        if sys.stdout.isatty():
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def _pause_if_tty() -> None:
+    """Hold the screen after an action's output so the user can read it
+    before the next clear+re-render wipes it away. No-op when piped."""
+    try:
+        if sys.stdout.isatty():
+            input("    press Enter to continue")
+    except (EOFError, KeyboardInterrupt):
+        print()
+
+
 def _run_menu_action(action: str, path: Path, keep_icc: bool, dry_run: bool) -> None:
     """Run one interactive operation against a path (reuses handle_one)."""
     ns = argparse.Namespace(output=None, keep_icc=keep_icc, dry_run=dry_run,
-                            inspect=False, verbose=False)
+                            inspect=False, verbose=False, max_pixels=None,
+                            no_clobber=False)
     if action == "inspect":
         ns.inspect = True
 
@@ -2025,9 +2047,12 @@ def menu_choose(keep_icc: bool, dry_run: bool) -> str:
 
 
 def run_interactive_menu() -> int:
-    print_top_banner()
     keep_icc, dry_run = False, False
     while True:
+        # clear + re-render every pass: the terminal never piles menus
+        # on top of previous output
+        _clear_screen()
+        print_top_banner()
         choice = menu_choose(keep_icc, dry_run).strip().lower()
         if choice in ("q", "quit", "exit", ""):
             print(c_dim("    later."))
@@ -2040,6 +2065,7 @@ def run_interactive_menu() -> int:
             continue
         if choice not in ("1", "2", "3", "4"):
             print(c_warn("    pick 1-6 or q."))
+            _pause_if_tty()
             continue
         raw = prompt_input("Target path").strip()
         if not raw:
@@ -2047,11 +2073,12 @@ def run_interactive_menu() -> int:
         path = Path(raw).expanduser()
         if not path.exists():
             print(c_err(f"    not found: {path}"))
+            _pause_if_tty()
             continue
         action = {"1": "strip", "2": "strip", "3": "inspect", "4": "dry"}[choice]
-        if action == "dry":
-            dry_run = True
-        _run_menu_action(action, path, keep_icc, dry_run)
+        # "4" is a one-shot dry-run: it must NOT flip the persistent toggle.
+        _run_menu_action(action, path, keep_icc, dry_run or action == "dry")
+        _pause_if_tty()
 
 
 # --------------------------------------------------------------------------- #
