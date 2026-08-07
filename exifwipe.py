@@ -639,8 +639,9 @@ def handle_one(path: Path, args: argparse.Namespace) -> bool:
             print(f"  {c_dim('(would strip PDF metadata)')} {path.name}")
             return True
         cleaned = strip_pdf_bytes(path)
-        if cleaned:
-            write_output(path, args.output, cleaned)
+        if not cleaned:
+            return False
+        write_output(path, args.output, cleaned)
         return True
 
     if args.verbose:
