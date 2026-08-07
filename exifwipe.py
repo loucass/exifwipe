@@ -342,9 +342,11 @@ def strip_image_bytes(path: Path, keep_icc: bool = False) -> tuple[bytes, str]:
         img.load()
         fmt = (img.format or path.suffix.lstrip(".")).upper()
 
-        # animated GIF / multipage TIFF — strip every frame, keep the animation
-        if fmt in ("GIF", "TIFF", "TIF") and getattr(img, "n_frames", 1) > 1:
-            return _strip_multiframe(img, fmt)
+        # animated GIF / multipage TIFF / animated WebP / AVIF —
+        # strip every frame, keep the animation
+        if fmt in ("GIF", "TIFF", "TIF", "WEBP", "AVIF") \
+                and getattr(img, "n_frames", 1) > 1:
+            return _strip_multiframe(img, fmt, keep_icc=keep_icc)
 
         # JPEG: prefer the lossless marker-stream strip. Only when the
         # photo is orientation-neutral — otherwise we must bake the
@@ -555,8 +557,9 @@ def _rebuild_frame(img, mode: str):
     return clean
 
 
-def _strip_multiframe(img, fmt: str) -> tuple[bytes, str]:
-    """Rebuild every frame of an animated GIF / multipage TIFF."""
+def _strip_multiframe(img, fmt: str, keep_icc: bool = False) -> tuple[bytes, str]:
+    """Rebuild every frame of an animated GIF / multipage TIFF /
+    animated WebP / AVIF from pixels, dropping all per-frame metadata."""
     n = getattr(img, "n_frames", 1)
     frames, durations, disposal = [], [], []
     for i in range(n):
@@ -575,9 +578,33 @@ def _strip_multiframe(img, fmt: str) -> tuple[bytes, str]:
                        duration=durations, disposal=disposal,
                        loop=int(img.info.get("loop", 0) or 0))
         fmt_out = "GIF"
-    else:
+    elif fmt == "TIFF":
         frames[0].save(buf, format="TIFF", save_all=True, append_images=frames[1:])
         fmt_out = "TIFF"
+    elif fmt in ("WEBP", "AVIF"):
+        # WebP supports a duration list; AVIF sequences exist but
+        # pillow-heif doesn't provide an animated save — refuse loudly.
+        if fmt == "AVIF":
+            # check whether the installed libwebp/avif plugin can write
+            # an animation; if not, fail with a clear error instead of
+            # silently collapsing to a single frame.
+            raise RuntimeError(
+                "animated AVIF cannot be rewritten losslessly — "
+                "exifwipe refuses to destroy the animation; re-save "
+                "frames yourself and scrub those instead"
+            )
+        common = {"format": "WEBP", "save_all": True,
+                  "append_images": frames[1:], "duration": durations,
+                  "loop": int(img.info.get("loop", 0) or 0),
+                  "exif": b"", "xmp": b""}
+        if keep_icc:
+            icc = img.info.get("icc_profile")
+            if icc:
+                common["icc_profile"] = icc
+        frames[0].save(buf, **common)
+        fmt_out = "WEBP"
+    else:
+        raise RuntimeError(f"multi-frame save not supported for {fmt}")
     return buf.getvalue(), fmt_out
 
 
