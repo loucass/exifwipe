@@ -532,6 +532,31 @@ def mpo_rotated_first(path):
     return Path(path)
 
 
+def heic_fixture(path, exif=True, xmp=True, avif=False):
+    """HEIC/AVIF with EXIF + XMP items via pillow-heif. Returns None when
+    pillow-heif (or its libheif) isn't available so tests can skip."""
+    try:
+        import pillow_heif
+        for _reg in ("register_heif_opener", "register_avif_opener"):
+            _fn = getattr(pillow_heif, _reg, None)
+            if _fn:
+                try:
+                    _fn()
+                except Exception:
+                    pass
+    except ImportError:
+        return None
+    img = Image.new("RGB", (32, 24), (200, 30, 30))
+    kw = {}
+    if exif:
+        kw["exif"] = piexif.dump({"0th": {0x010F: b"HEIFCAMLEAK"},
+                                   "Exif": {0x9003: b"2024:01:02 03:04:05"}})
+    if xmp:
+        kw["xmp"] = b"<x:xmpmeta>heif-xmp-leak</x:xmpmeta>"
+    img.save(path, format="AVIF" if avif else "HEIF", **kw)
+    return Path(path)
+
+
 def tiff_with_ifd_cycle(path):
     """Hostile TIFF: IFD1's next pointer loops back to IFD0. The walker
     must terminate and the surgery must not corrupt the file."""
