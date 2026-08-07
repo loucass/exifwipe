@@ -268,6 +268,16 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".tif", ".tiff",
               ".bmp", ".gif", ".heic", ".heif", ".avif"}
 DOC_EXTS = {".pdf"}  # pikepdf dep — see strip_pdf_metadata()
 
+# result codes for handle_one(): OK / ERROR / SKIPPED (unrecognized)
+R_OK, R_ERR, R_SKIP = 0, 1, 2
+
+# TIFF-family RAW containers. These are NEVER pixel-rebuilt — the sensor
+# data can't be re-encoded — they get lossless in-place IFD surgery
+# (EXIF/GPS IFDs emptied, identifying tags blanked, pixel bytes untouched).
+RAW_FORMATS = ("dng", "cr2", "nef", "arw", "orf", "rw2", "pef", "srw",
+               "sr2", "3fr")
+RAW_EXTENSIONS = frozenset("." + f for f in RAW_FORMATS)
+
 
 # --------------------------------------------------------------------------- #
 # inspection — print what exiftool would surface
@@ -338,6 +348,368 @@ def _verify_with_exiftool(path: Path) -> Optional[list]:
             continue
         leaks.append(key)
     return leaks
+
+
+# TIFF tags that are identifying (vs structural layout tags). Orientation
+# is deliberately NOT here: it's a display instruction, not identity, and
+# RAW containers keep it because the sensor pixels can't be re-rotated.
+_TIFF_IDENTIFYING = {
+    0x010E: "ImageDescription", 0x010F: "Make", 0x0110: "Model",
+    0x0131: "Software", 0x0132: "DateTime", 0x013B: "Artist",
+    0x02BC: "XMLPacket", 0x83BB: "IPTC", 0x8649: "Photoshop",
+    0x8298: "Copyright", 0x8769: "ExifIFD", 0x8825: "GPSInfo",
+    0x9286: "UserComment", 0x9C9B: "XPTitle", 0x9C9C: "XPComment",
+    0x9C9D: "XPAuthor", 0x9C9E: "XPKeywords",
+    0xC62D: "SerialNumber", 0xC614: "UniqueCameraModel",
+    0xC615: "LocalizedCameraModel", 0xC68B: "OriginalRawFileName",
+    0xC68C: "OriginalRawFileData", 0xC634: "DNGPrivateData",
+}
+
+# tags whose VALUES are blanked in place during RAW/TIFF surgery (all
+# size-1 types: ASCII / BYTE / UNDEFINED — safe to overwrite without
+# touching any offset). 0x8773 (ICC) is blanked only when NOT keep_icc.
+_TIFF_BLANK = {
+    0x010E, 0x010F, 0x0110, 0x0131, 0x0132, 0x013B, 0x02BC, 0x83BB,
+    0x8649, 0x8298, 0x9286, 0x9C9B, 0x9C9C, 0x9C9D, 0x9C9E,
+    0xC62D, 0xC614, 0xC615, 0xC68B, 0xC68C, 0xC634,
+}
+
+# TIFF layout per flavor. Classic TIFF (magic 42): IFD entry = tag(2)
+# + type(2) + count(4, uint32!) + value/offset(4) = 12 bytes; the IFD's
+# own entry-count field is uint16. BigTIFF (magic 43 — explicitly allowed
+# by the DNG spec): entry = tag(2) + type(2) + count(8) + value/offset(8)
+# = 20 bytes; IFD entry-count is uint64. Returns (entry_size,
+# ifd_count_size, entry_count_size, offset_size, header_len).
+def _tiff_layout(bo: str, magic: int) -> tuple:
+    if magic == 43:
+        return (20, 8, 8, 8, 16)
+    return (12, 2, 4, 4, 8)
+
+
+_TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4,
+              10: 8, 11: 4, 12: 8, 13: 4}
+
+
+def _tiff_parse_header(data: bytes):
+    """Return (byteorder, magic) or None for non-TIFF input."""
+    if len(data) < 8:
+        return None
+    bo = "little" if data[:2] == b"II" else "big" if data[:2] == b"MM" else None
+    if bo is None:
+        return None
+    magic = int.from_bytes(data[2:4], bo)
+    if magic not in (42, 43):
+        return None
+    return bo, magic
+
+
+def _iter_tiff_entries(data: bytes, bo: str, magic: int):
+    """Yield (entry_pos, tag, typ, count, value_field_pos) for every entry
+    in every reachable IFD — next-IFD chain, SubIFDs (0x014A) and the
+    EXIF/GPS IFDs they point at. Cycle-safe (seen set) and bounded, so a
+    hostile IFD graph can't hang the walker."""
+    entry, ifd_cnt, ent_cnt, off_size, header = _tiff_layout(bo, magic)
+    # the IFD0 offset sits right before the header tail: bytes 4-7 for
+    # classic TIFF, bytes 8-15 for BigTIFF
+    ifd0 = int.from_bytes(data[header - off_size:header], bo)
+    seen = set()
+    queue = [ifd0]
+    while queue:
+        off = queue.pop(0)
+        if off in seen or off + ifd_cnt > len(data):
+            continue
+        seen.add(off)
+        count = int.from_bytes(data[off:off + ifd_cnt], bo)
+        # cap entry iteration: classic TIFF counts are uint16; BigTIFF
+        # counts are uint64 but a real photo IFD has a few hundred entries
+        if count > 1_000_000:
+            count = 1_000_000          # hostile count — don't iterate forever
+        p = off + ifd_cnt
+        for _ in range(count):
+            if p + entry > len(data):
+                break
+            tag = int.from_bytes(data[p:p + 2], bo)
+            typ = int.from_bytes(data[p + 2:p + 4], bo)
+            cnt = int.from_bytes(data[p + 4:p + 4 + ent_cnt], bo)
+            # value/offset field: entry start + 4 (tag/type) + offset_size
+            vf = p + 4 + off_size
+            yield (p, tag, typ, cnt, vf)
+            if tag == 0x014A and typ in (3, 4, 9, 13):   # SubIFDs: n offsets
+                n_sub = min(cnt, 256)
+                for i in range(n_sub):
+                    so = int.from_bytes(data[vf + i * off_size:vf + (i + 1) * off_size], bo)
+                    if so:
+                        queue.append(so)
+            elif tag in (0x8769, 0x8825):                # EXIF / GPS IFD
+                tgt = int.from_bytes(data[vf:vf + off_size], bo)
+                if tgt:
+                    queue.append(tgt)
+            p += entry
+        if p + off_size <= len(data):
+            nxt = int.from_bytes(data[p:p + off_size], bo)
+            if nxt:
+                queue.append(nxt)
+
+
+def _tiff_value_bytes(data: bytes, bo: str, magic: int, typ: int, cnt: int,
+                      vf: int) -> bytes:
+    """Raw value bytes of a TIFF entry (inline or via offset)."""
+    entry, ifd_cnt, ent_cnt, off_size, header = _tiff_layout(bo, magic)
+    tsize = _TYPE_SIZE.get(typ)
+    if tsize is None:
+        return b""
+    nbytes = cnt * tsize
+    max_inline = off_size
+    if nbytes <= max_inline:
+        start = vf
+    else:
+        start = int.from_bytes(data[vf:vf + off_size], bo)
+    if start + nbytes > len(data):
+        return b""
+    return data[start:start + nbytes]
+
+
+def _value_is_blank(value: bytes) -> bool:
+    """True when a value carries no content (all spaces / NULs / empty)."""
+    return all(b in (32, 0) for b in value)
+
+
+def _tiff_find_identifying(data: bytes) -> list:
+    """Walk every reachable TIFF IFD and return identifying tag names that
+    still carry real content — an ExifIFD/GPS pointer is only flagged when
+    the pointed-to IFD has entries, and scalar tags only when their value
+    isn't blank. Handles classic TIFF and BigTIFF."""
+    hdr = _tiff_parse_header(data)
+    if hdr is None:
+        return []
+    bo, magic = hdr
+    ifd_cnt = _tiff_layout(bo, magic)[1]
+    off_size = _tiff_layout(bo, magic)[3]
+    found = []
+    for (p, tag, typ, cnt, vf) in _iter_tiff_entries(data, bo, magic):
+        name = _TIFF_IDENTIFYING.get(tag)
+        if name is None:
+            continue
+        if tag in (0x8769, 0x8825):
+            tgt = int.from_bytes(data[vf:vf + off_size], bo)
+            if tgt and tgt + ifd_cnt <= len(data):
+                if int.from_bytes(data[tgt:tgt + ifd_cnt], bo) > 0:
+                    if name not in found:
+                        found.append(name)
+        else:
+            if not _value_is_blank(_tiff_value_bytes(data, bo, magic, typ, cnt, vf)):
+                if name not in found:
+                    found.append(name)
+    return found
+
+
+def _tiff_protected_regions(data: bytes, bo: str, magic: int) -> list:
+    """Byte ranges that must never be overwritten as tag *values*: the
+    file header and every reachable IFD block (count + entries + next
+    pointer). A hostile file can point a tag's value offset at its own
+    structure — blanking there would silently destroy the file. The
+    surgery refuses the file instead."""
+    entry, ifd_cnt, ent_cnt, off_size, header = _tiff_layout(bo, magic)
+    regions = [(0, header)]
+    ifd0 = int.from_bytes(data[header - off_size:header], bo)
+    seen, queue = set(), [ifd0]
+    while queue:
+        off = queue.pop(0)
+        if off in seen or off + ifd_cnt > len(data):
+            continue
+        seen.add(off)
+        count = int.from_bytes(data[off:off + ifd_cnt], bo)
+        if count > 1_000_000:
+            count = 1_000_000
+        regions.append((off, min(off + ifd_cnt + count * entry + off_size,
+                                 len(data))))
+        p = off + ifd_cnt
+        for _ in range(count):
+            if p + entry > len(data):
+                break
+            tag = int.from_bytes(data[p:p + 2], bo)
+            typ = int.from_bytes(data[p + 2:p + 4], bo)
+            cnt = int.from_bytes(data[p + 4:p + 4 + ent_cnt], bo)
+            vfield = p + 4 + off_size
+            if tag == 0x014A and typ in (3, 4, 9, 13):   # SubIFDs
+                for i in range(min(cnt, 256)):
+                    so = int.from_bytes(data[vfield + i * off_size:
+                                             vfield + (i + 1) * off_size], bo)
+                    if so:
+                        queue.append(so)
+            elif tag in (0x8769, 0x8825):                # EXIF / GPS IFD
+                tgt = int.from_bytes(data[vfield:vfield + off_size], bo)
+                if tgt:
+                    queue.append(tgt)
+            p += entry
+        if p + off_size <= len(data):
+            nxt = int.from_bytes(data[p:p + off_size], bo)
+            if nxt:
+                queue.append(nxt)
+    return regions
+
+
+def _overlaps_protected(regions: list, start: int, end: int) -> bool:
+    """True when [start, end) touches any protected structural region."""
+    return any(start < r_end and end > r_start for (r_start, r_end) in regions)
+
+
+def _tiff_structure_ok(data: bytes, bo: str, magic: int) -> bool:
+    """Strict structural validation: every reachable IFD's declared
+    entries and every external value must lie inside the file. A truncated
+    or hostile container fails here — surgery must not "clean" a file it
+    can't fully verify."""
+    entry, ifd_cnt, ent_cnt, off_size, header = _tiff_layout(bo, magic)
+    ifd0 = int.from_bytes(data[header - off_size:header], bo)
+    if ifd0 < header or ifd0 + ifd_cnt > len(data):
+        return False
+    seen = set()
+    queue = [ifd0]
+    while queue:
+        off = queue.pop(0)
+        if off in seen:
+            continue
+        if off + ifd_cnt > len(data):
+            return False               # referenced IFD is missing
+        seen.add(off)
+        count = int.from_bytes(data[off:off + ifd_cnt], bo)
+        if count > 1_000_000:
+            return False               # hostile count
+        p = off + ifd_cnt
+        if p + count * entry + off_size > len(data):
+            return False               # IFD claims entries past EOF
+        for _ in range(count):
+            tag = int.from_bytes(data[p:p + 2], bo)
+            typ = int.from_bytes(data[p + 2:p + 4], bo)
+            cnt = int.from_bytes(data[p + 4:p + 4 + ent_cnt], bo)
+            tsize = _TYPE_SIZE.get(typ)
+            vfield = p + 4 + off_size
+            if tsize:
+                nbytes = cnt * tsize
+                if nbytes > off_size:
+                    off2 = int.from_bytes(data[vfield:vfield + off_size], bo)
+                    if off2 + nbytes > len(data):
+                        return False  # value extends past EOF
+            if tag == 0x014A and typ in (3, 4, 9, 13):
+                for i in range(min(cnt, 256)):
+                    so = int.from_bytes(data[vfield + i * off_size:
+                                             vfield + (i + 1) * off_size], bo)
+                    if so:
+                        queue.append(so)
+            elif tag in (0x8769, 0x8825):
+                tgt = int.from_bytes(data[vfield:vfield + off_size], bo)
+                if tgt:
+                    queue.append(tgt)
+            p += entry
+        if p + off_size > len(data):
+            return False
+        nxt = int.from_bytes(data[p:p + off_size], bo)
+        if nxt:
+            queue.append(nxt)
+    return True
+
+
+def _tiff_has_tag(data: bytes, wanted: int) -> bool:
+    """True if any reachable IFD carries `wanted` (e.g. DNGVersion 0xC612)."""
+    hdr = _tiff_parse_header(data)
+    if hdr is None:
+        return False
+    bo, magic = hdr
+    for (_, tag, _, _, _) in _iter_tiff_entries(data, bo, magic):
+        if tag == wanted:
+            return True
+    return False
+
+
+def _is_tiff_family(data: bytes) -> bool:
+    return _tiff_parse_header(data) is not None
+
+
+def _tiff_strip_lossless(data: bytes, keep_icc: bool = False):
+    """Lossless metadata surgery for TIFF-family containers (TIFF / DNG /
+    CR2 / NEF / ARW / ORF / RW2 / PEF / SRW / SR2...).
+
+    No offset is ever remapped, so pixel data stays byte-identical:
+      * every EXIF IFD (0x8769) and GPS IFD (0x8825) target is overwritten
+        with an empty IFD (count=0, next=0) — MakerNotes, DateTimeOriginal,
+        GPS coordinates and the whole Interop chain die with them;
+      * identifying scalar tags (Make, Model, Software, Artist, Copyright,
+        ImageDescription, SerialNumber, DNG camera model / private data /
+        original-raw blobs...) are blanked in place;
+      * ICC (0x8773) is blanked unless keep_icc.
+
+    Returns cleaned bytes, or None when the input isn't a parseable TIFF
+    container (caller decides: refuse loudly for RAW, fall back to a
+    rebuild for plain TIFF)."""
+    hdr = _tiff_parse_header(data)
+    if hdr is None:
+        return None
+    bo, magic = hdr
+    entry, ifd_cnt, ent_cnt, off_size, header = _tiff_layout(bo, magic)
+    if not _tiff_structure_ok(data, bo, magic):
+        # truncated / hostile container — refuse instead of "cleaning" a
+        # file whose result we can't verify
+        return None
+    # structural regions that must never be blanked as tag values: the
+    # header and every reachable IFD block (a hostile file can point a
+    # tag's value offset at its own structure — that's a refuse, not a wipe)
+    protected = _tiff_protected_regions(data, bo, magic)
+    out = bytearray(data)
+    for (p, tag, typ, cnt, vf) in _iter_tiff_entries(data, bo, magic):
+        if tag in (0x8769, 0x8825):
+            # physically destroy the pointed-to EXIF/GPS IFD: the whole
+            # entry block AND every payload it referenced. Orphaned bytes
+            # are unreachable but still forensically present — zero them.
+            tgt = int.from_bytes(data[vf:vf + off_size], bo)
+            if tgt and tgt + ifd_cnt <= len(data):
+                tcount = int.from_bytes(data[tgt:tgt + ifd_cnt], bo)
+                q = tgt + ifd_cnt
+                for _ in range(min(tcount, 4096)):
+                    if q + entry > len(data):
+                        break
+                    typ2 = int.from_bytes(data[q + 2:q + 4], bo)
+                    cnt2 = int.from_bytes(data[q + 4:q + 4 + ent_cnt], bo)
+                    tsize = _TYPE_SIZE.get(typ2)
+                    if tsize:
+                        nbytes = cnt2 * tsize
+                        if 0 < nbytes <= len(data):
+                            vfield = q + 4 + off_size
+                            if nbytes <= off_size:
+                                start = vfield
+                            else:
+                                start = int.from_bytes(data[vfield:vfield + off_size], bo)
+                                if _overlaps_protected(protected, start,
+                                                       start + nbytes):
+                                    continue  # hostile target — block dies anyway
+                            if start + nbytes <= len(out):
+                                out[start:start + nbytes] = b"\x00" * nbytes
+                    q += entry
+                block_end = min(q + off_size, len(out))
+                out[tgt:block_end] = b"\x00" * (block_end - tgt)
+        elif tag in _TIFF_BLANK or (tag == 0x8773 and not keep_icc):
+            tsize = _TYPE_SIZE.get(typ)
+            if tsize is None:
+                continue
+            nbytes = cnt * tsize
+            if nbytes <= 0 or nbytes > len(data):
+                continue
+            if nbytes <= off_size:
+                start = vf
+            else:
+                start = int.from_bytes(data[vf:vf + off_size], bo)
+                if _overlaps_protected(protected, start, start + nbytes):
+                    # hostile value offset pointing at the header/IFDs —
+                    # refuse the file instead of corrupting it
+                    return None
+            if start + nbytes <= len(out):
+                out[start:start + nbytes] = b" " * nbytes
+    cleaned = bytes(out)
+    # verify our own work before handing it out — a wipe that still leaks
+    # is not a wipe
+    if _tiff_find_identifying(cleaned):
+        raise RuntimeError("TIFF surgery left identifying metadata behind "
+                           "— refusing to write a dirty file")
+    return cleaned
 
 
 def _verify_bytes(path: Path, fmt: str) -> list:
@@ -412,6 +784,8 @@ def _verify_bytes(path: Path, fmt: str) -> list:
             leaks.append("comment-ext")
         if b"XMP Data" in data:
             leaks.append("XMP")
+    elif fmt in ("tiff",) + tuple(RAW_FORMATS):
+        leaks = _tiff_find_identifying(data)
     elif fmt in ("heif", "avif"):
         # ISO BMFF: hunt box types that carry metadata
         if b"Exif" in data or b"mime" in data:
@@ -436,31 +810,34 @@ def verify_clean(path: Path) -> tuple[bool, list]:
 def print_formats_matrix() -> None:
     """What exifwipe guarantees per format — honest about limits."""
     rows = [
-        ("jpeg",    "lossless marker rewrite (no re-encode)",
-                    "clean guaranteed when orientation-neutral"),
-        ("jpeg-rot", "orientation baked into pixels, quality-95 re-encode",
-                    "clean (pixels re-encoded, not byte-identical)"),
-        ("png",     "fresh frame rebuild, empty PngInfo",
-                    "clean"),
-        ("gif",     "byte-exact frame pass + comment/XMP drop",
-                    "clean, frames/palette/transparency preserved"),
-        ("webp",    "frame rebuild, exif/xmp/icc stripped",
-                    "clean; animated frames preserved"),
-        ("avif",    "re-encode via pillow-heif",
-                    "clean single-frame only; animated AVIF refuses"),
-        ("tiff",    "multi-page rebuild all tags dropped",
-                    "clean (best-effort on exotic tags)"),
-        ("bmp",     "pixel rebuild",
-                    "clean"),
-        ("heif",    "re-encode via pillow-heif",
-                    "clean single-frame only"),
-        ("pdf",     "pikepdf: drops /Info + XMP stream",
-                    "BEST-EFFORT: embedded-image EXIF, /Lang, JS etc. may survive"),
+        ("jpeg",      "lossless marker rewrite (no re-encode)",
+                      "clean; pixels byte-identical when orientation-neutral"),
+        ("jpeg-rot",  "orientation baked into pixels, q95 re-encode",
+                      "clean (pixels re-encoded, not byte-identical)"),
+        ("png",       "fresh frame rebuild, empty PngInfo",
+                      "clean"),
+        ("gif",       "lossless byte rewrite: comments/XMP dropped",
+                      "clean; frames/palette/loop byte-exact"),
+        ("webp",      "frame rebuild; lossless-in -> lossless-out",
+                      "clean; animated frames preserved"),
+        ("tiff",      "lossless in-place IFD surgery (no re-encode)",
+                      "clean; pixels + pages byte-identical"),
+        ("dng/cr2/nef/arw/orf/rw2/pef/srw",
+                      "lossless in-place IFD surgery",
+                      "clean; sensor data byte-identical, never rebuilt"),
+        ("bmp",       "pixel rebuild",
+                      "clean"),
+        ("heif",      "re-encode via pillow-heif",
+                      "clean single-frame only"),
+        ("avif",      "re-encode via pillow-heif",
+                      "clean single-frame only; animated AVIF refuses"),
+        ("pdf",       "pikepdf: /Info + /Metadata + /Lang/JS/PageLabels",
+                      "BEST-EFFORT: embedded-image EXIF may survive"),
     ]
     w = max(len(r[0]) for r in rows)
-    print(c_head("format capability — guaranteed vs best-effort"))
+    print(c_head("format capability — mechanism | guarantee (honest)"))
     for name, how, claim in rows:
-        print(f"  {c_info(name.ljust(w))}  {claim}")
+        print(f"  {c_info(name.ljust(w))}  {c_dim(how.ljust(56))} {claim}")
 
 
 # --------------------------------------------------------------------------- #
@@ -494,6 +871,13 @@ def strip_image_bytes(path: Path, keep_icc: bool = False) -> tuple[bytes, str]:
 
     Returns (clean_bytes, output_format_lowercase).
     """
+    raw = path.read_bytes()
+    # TIFF family -> lossless in-place surgery. NEVER re-encode sensor
+    # data: pixels byte-identical, pages kept, no encode cost.
+    if raw[:4] in (b"II*\x00", b"MM\x00*") and _is_tiff_family(raw):
+        surg = _tiff_strip_lossless(raw, keep_icc)
+        if surg is not None:
+            return surg, "tiff"
     with Image.open(path) as img:
         img.load()
         fmt = (img.format or path.suffix.lstrip(".")).upper()
@@ -966,6 +1350,22 @@ def _sniff_format(path: Path) -> Optional[str]:
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return "webp"
     if head[:4] in (b"II*\x00", b"MM\x00*"):
+        # TIFF-family RAW containers are structurally TIFF; the extension
+        # (or a deep read below) tells them apart from a plain TIFF
+        ext = path.suffix.lower()
+        if ext in RAW_EXTENSIONS:
+            return ext.lstrip(".")
+        # CR2: 16-byte header (IFD0 at 0x10) + CR2 magic 0x0201 at offset 8
+        if (head[:8] == b"II*\x00\x10\x00\x00\x00"
+                and head[8:10] == b"\x01\x02"):
+            return "cr2"
+        # extensionless DNG: the DNGVersion tag (0xC612) is authoritative
+        try:
+            more = path.open("rb").read(1 << 20)
+        except OSError:
+            more = b""
+        if more and _tiff_has_tag(more, 0xC612):
+            return "dng"
         return "tiff"
     if head[:2] == b"BM":
         return "bmp"
@@ -982,24 +1382,43 @@ def _sniff_format(path: Path) -> Optional[str]:
     return None
 
 
-def handle_one(path: Path, args: argparse.Namespace) -> bool:
-    """Return True if the file was processed successfully, False on error.
-
-    The flow per file:
-      - dry-run       -> inspect what would happen and return.
-      - inspect-only  -> inspect and return.
-      - otherwise     -> strip and write.
+def handle_one(path: Path, args: argparse.Namespace) -> int:
+    """Process one file. Returns R_OK / R_ERR / R_SKIP.
 
     Dispatch is by magic bytes (sniffed), not by file extension, so a
-    downloaded JPEG with no extension is still stripped. The extension
-    only degrades to deciding the output filename."""
-
+    downloaded JPEG with no extension is still stripped. Unrecognized
+    files are SKIPPED (never counted as errors)."""
     fmt = _sniff_format(path) if path.is_file() else None
     if fmt is None:
-        # not a real image/pdf we recognize — skip silently on dry-ness
         if args.verbose:
             print(f"  {c_dim('[skip] unrecognized:')} {path.name}")
-        return False
+        return R_SKIP
+
+    if fmt in RAW_FORMATS:
+        # RAW: NEVER pixel-rebuild (the sensor data can't be re-encoded) —
+        # lossless in-place IFD surgery only, loud refusal on failure
+        if args.dry_run or args.inspect:
+            try:
+                st = path.stat()
+                print(f"  {c_info(fmt.upper())} {c_head(path.name)}: "
+                      f"{st.st_size:,} bytes, TIFF-family container — "
+                      "surgery would blank EXIF/GPS/MakerNotes losslessly")
+            except OSError as e:
+                print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
+                return R_ERR
+            return R_OK
+        try:
+            cleaned = _tiff_strip_lossless(path.read_bytes(),
+                                           keep_icc=args.keep_icc)
+            if cleaned is None:
+                raise RuntimeError(
+                    "not a parseable TIFF container — refusing to rebuild "
+                    "RAW sensor data (BigTIFF/encrypted/corrupt?)")
+            write_output(path, args.output, cleaned)
+        except Exception as e:
+            print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
+            return R_ERR
+        return R_OK
 
     if fmt in ("jpeg", "png", "gif", "tiff", "webp", "bmp", "heif", "avif"):
         if args.dry_run or args.inspect:
@@ -1007,38 +1426,38 @@ def handle_one(path: Path, args: argparse.Namespace) -> bool:
                 inspect_image(path)
             except Exception as e:
                 print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
-                return False
-            return True
+                return R_ERR
+            return R_OK
         try:
             cleaned, fmt_out = strip_image_bytes(path, keep_icc=args.keep_icc)
             write_output(path, args.output, cleaned)
         except Exception as e:
             print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
-            return False
+            return R_ERR
         if args.verbose:
             try:
                 inspect_image(path if args.output is None else args.output / path.name)
             except Exception as e:
                 print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
-        return True
+        return R_OK
 
     if fmt == "pdf":
         if args.dry_run or args.inspect:
             print(f"  {c_dim('(would strip PDF metadata)')} {path.name}")
-            return True
+            return R_OK
         cleaned = strip_pdf_bytes(path)
         if not cleaned:
-            return False
+            return R_ERR
         try:
             write_output(path, args.output, cleaned)
         except Exception as e:
             print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
-            return False
-        return True
+            return R_ERR
+        return R_OK
 
     if args.verbose:
         print(f"  {c_dim('[skip] unsupported:')} {path.name}")
-    return False
+    return R_SKIP
 
 
 def iter_inputs(path: Path) -> Iterable[Path]:
@@ -1088,13 +1507,21 @@ def _run_menu_action(action: str, path: Path, keep_icc: bool, dry_run: bool) -> 
     if not targets:
         print(c_warn("    nothing processed (no supported files found)"))
         return
-    n_ok, n_err = 0, 0
+    n_ok = n_err = n_skip = 0
     for p in targets:
-        if handle_one(p, ns):
+        res = handle_one(p, ns)
+        if res == R_OK:
             n_ok += 1
-        else:
+        elif res == R_ERR:
             n_err += 1
-    print(f"\n  {c_ok(str(n_ok))} processed, {c_err(str(n_err))} errors")
+        else:
+            n_skip += 1
+    msg = f"\n  {c_ok(str(n_ok))} processed"
+    if n_skip:
+        msg += f", {c_dim(str(n_skip))} skipped"
+    if n_err:
+        msg += f", {c_err(str(n_err))} errors"
+    print(msg)
 
 
 def _state(val: bool) -> str:
@@ -1210,9 +1637,14 @@ def main(argv: Optional[list] = None) -> int:
     if args.input is None:
         return run_interactive_menu()
 
+    if not args.input.exists():
+        print(f"  [ERR] not found: {args.input}", file=sys.stderr)
+        return 2
+
+    targets = list(iter_inputs(args.input))
+
     # --inspect is a read-only mode
     if args.inspect:
-        targets = list(iter_inputs(args.input))
         n_err = 0
         for p in targets:
             try:
@@ -1220,6 +1652,12 @@ def main(argv: Optional[list] = None) -> int:
                 if fmt in ("jpeg", "png", "gif", "tiff", "webp", "bmp",
                            "heif", "avif"):
                     inspect_image(p)
+                elif fmt in RAW_FORMATS:
+                    st = p.stat()
+                    print(f"\n=== {p.name} ===")
+                    print(f"  RAW {fmt.upper()}: {st.st_size:,} bytes, "
+                          "TIFF-family container — `exiftool -a -G1 FILE` "
+                          "sees what surgery would remove")
                 elif fmt == "pdf":
                     print(f"\n=== {p.name} ===")
                     print("  (PDF — use pikepdf or `exiftool -all=` to inspect)")
@@ -1228,12 +1666,6 @@ def main(argv: Optional[list] = None) -> int:
                 n_err += 1
         print("\n-- exiftool reference --\n" + exiftool_hint())
         return 0 if n_err == 0 else 3
-
-    if not args.input.exists():
-        print(f"  [ERR] not found: {args.input}", file=sys.stderr)
-        return 2
-
-    targets = list(iter_inputs(args.input))
 
     # guard: batch input to a single-file `-o` silently overwrites itself.
     # If --output looks like a FILE (has a suffix, isn't a dir) but we're
@@ -1248,13 +1680,17 @@ def main(argv: Optional[list] = None) -> int:
         )
         return 2
 
-    n_ok, n_err = 0, 0
+    n_ok = n_err = n_skip = 0
     leaks = []
     for p in targets:
-        if handle_one(p, args):
+        res = handle_one(p, args)
+        if res == R_OK:
             n_ok += 1
-        else:
+        elif res == R_ERR:
             n_err += 1
+            continue
+        else:
+            n_skip += 1
             continue
         if args.verify:
             check = p if args.output is None else args.output / p.name
@@ -1268,7 +1704,12 @@ def main(argv: Optional[list] = None) -> int:
                       f"{', '.join(found)}", file=sys.stderr)
                 n_err += 1
 
-    print(f"\ndone. {n_ok} processed, {n_err} errors.")
+    msg = f"\ndone. {n_ok} processed"
+    if n_skip:
+        msg += f", {n_skip} skipped"
+    if n_err:
+        msg += f", {n_err} errors"
+    print(msg + ".")
     if args.verify:
         if leaks:
             print(f"  {c_err('VERIFY FAILED:')} metadata still present in "
