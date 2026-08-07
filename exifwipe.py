@@ -622,7 +622,11 @@ def handle_one(path: Path, args: argparse.Namespace) -> bool:
 
     if sfx in IMAGE_EXTS:
         if args.dry_run or args.inspect:
-            inspect_image(path)
+            try:
+                inspect_image(path)
+            except Exception as e:
+                print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
+                return False
             return True
         try:
             cleaned, fmt_out = strip_image_bytes(path, keep_icc=args.keep_icc)
@@ -815,14 +819,19 @@ def main(argv: Optional[list] = None) -> int:
     # --inspect is a read-only mode
     if args.inspect:
         targets = list(iter_inputs(args.input))
+        n_err = 0
         for p in targets:
-            if p.suffix.lower() in IMAGE_EXTS:
-                inspect_image(p)
-            elif p.suffix.lower() in DOC_EXTS:
-                print(f"\n=== {p.name} ===")
-                print("  (PDF — use pikepdf or `exiftool -all=` to inspect)")
+            try:
+                if p.suffix.lower() in IMAGE_EXTS:
+                    inspect_image(p)
+                elif p.suffix.lower() in DOC_EXTS:
+                    print(f"\n=== {p.name} ===")
+                    print("  (PDF — use pikepdf or `exiftool -all=` to inspect)")
+            except Exception as e:
+                print(f"  {c_err('[ERR]')} {c_warn(p.name)}: {e}", file=sys.stderr)
+                n_err += 1
         print("\n-- exiftool reference --\n" + exiftool_hint())
-        return 0
+        return 0 if n_err == 0 else 3
 
     if not args.input.exists():
         print(f"  [ERR] not found: {args.input}", file=sys.stderr)
