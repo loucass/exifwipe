@@ -29,8 +29,8 @@ def test_report_tiff_inventory(tmp_path):
     src = cr2_fixture(tmp_path / "r.cr2")
     inv = exifwipe._tiff_inventory(src.read_bytes())
     joined = "\n".join(inv)
-    assert "0x010F" in joined
-    assert "0x0110" in joined
+    assert "Make (0x010F)" in joined
+    assert "Model (0x0110)" in joined
     assert "ExifIFD block (destroyed)" in joined
     assert "GPSInfo block (destroyed)" in joined
 

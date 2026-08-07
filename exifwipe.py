@@ -576,7 +576,7 @@ def _tiff_inventory(data: bytes, keep_icc: bool = False,
         elif tag == 0x0112 and drop_orientation:
             names.append("Orientation (0x0112)")
         elif tag in _TIFF_IDENTIFYING:
-            names.append(f"tag 0x{tag:04X}")
+            names.append(f"{_TIFF_IDENTIFYING[tag]} (0x{tag:04X})")
     # dedupe, keep order
     seen, out = set(), []
     for n in names:
