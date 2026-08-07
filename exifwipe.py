@@ -639,9 +639,17 @@ def strip_pdf_bytes(path: Path) -> bytes:
                 pass
             try:
                 # /Info (DocInfo) holds title/author/creator/date...
-                pdf.docinfo = pikepdf.Dictionary()
+                # pikepdf requires the new value to be an INDIRECT object,
+                # otherwise assignment silently raises ValueError. Clearing
+                # to an empty indirect dictionary removes every /Info key.
+                pdf.docinfo = pdf.make_indirect(pikepdf.Dictionary())
             except Exception:
-                pass
+                # if that failed the /Info must still be replaced — delete
+                # the trailer key outright as a fallback
+                try:
+                    del pdf.trailer["/Info"]
+                except Exception:
+                    pass
             buf = io.BytesIO()
             pdf.save(buf)
             return buf.getvalue()
