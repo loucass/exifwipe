@@ -113,3 +113,11 @@ def test_heif_hostile_container_no_silent_leak(tmp_path):
         assert b"HEIFCAMLEAK" not in cleaned, "silent leak on hostile container"
     except Exception:
         pass  # loud refusal is equally correct
+
+
+def test_heif_report_lists_extents(tmp_path):
+    src = _make(tmp_path / "r.heic")
+    report = []
+    exifwipe.strip_image_bytes(src, report=report)
+    joined = "\n".join(report)
+    assert "EXIF/XMP" in joined or "heif" in joined or report

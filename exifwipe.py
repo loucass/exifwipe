@@ -556,6 +556,36 @@ def _tiff_find_identifying(data: bytes) -> list:
     return found
 
 
+def _tiff_inventory(data: bytes, keep_icc: bool = False,
+                    drop_orientation: bool = False) -> list:
+    """Names of the identifying metadata a TIFF-family wipe will destroy
+    (for --report): EXIF/GPS blocks, identifying tags, ICC unless kept,
+    Orientation only when it's being dropped."""
+    hdr = _tiff_parse_header(data)
+    if hdr is None:
+        return []
+    bo, magic = hdr
+    names = []
+    for (p, tag, typ, cnt, vf) in _iter_tiff_entries(data, bo, magic):
+        if tag == 0x8769:
+            names.append("ExifIFD block (destroyed)")
+        elif tag == 0x8825:
+            names.append("GPSInfo block (destroyed)")
+        elif tag == 0x8773 and not keep_icc:
+            names.append("ICC profile (0x8773)")
+        elif tag == 0x0112 and drop_orientation:
+            names.append("Orientation (0x0112)")
+        elif tag in _TIFF_IDENTIFYING:
+            names.append(f"tag 0x{tag:04X}")
+    # dedupe, keep order
+    seen, out = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
 def _tiff_protected_regions(data: bytes, bo: str, magic: int) -> list:
     """Byte ranges that must never be overwritten as tag *values*: the
     file header and every reachable IFD block (count + entries + next
@@ -1130,6 +1160,7 @@ def _jpeg_sof_size(data: bytes):
 
 def strip_image_bytes(path: Path, keep_icc: bool = False,
                       max_pixels: Optional[int] = None,
+                      report: Optional[list] = None,
                       drop_orientation: bool = False,
                       perturb: Optional[int] = None) -> tuple[bytes, str]:
     """Strip metadata, keeping pixels as close to byte-identical as the
@@ -1166,13 +1197,17 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
     (kept by default: display-only, sensor pixels can't be re-rotated).
     `perturb` (1-4) applies deterministic low-amplitude noise to rebuilt
     pixels so reverse-image search can't match the original — opt-in,
-    and it does change pixels slightly.
+    and it does change pixels slightly. `report` (optional list)
+    collects the names of every metadata field this wipe removed.
 
     Returns (clean_bytes, output_format_lowercase).
     """
     if max_pixels is None:
         max_pixels = DEFAULT_MAX_PIXELS
     raw = path.read_bytes()
+    sf = _sniff_bytes(raw)
+    if report is not None:
+        report.extend(_inventory_metadata(raw, sf, keep_icc, drop_orientation))
     # TIFF family -> lossless in-place surgery. NEVER re-encode sensor
     # data: every axis favors the surgery (pixels byte-identical, pages
     # kept, no encode cost).
@@ -2289,6 +2324,117 @@ def strip_pdf_bytes(path: Path) -> bytes:
 
 
 # --------------------------------------------------------------------------- #
+# report — exactly which metadata fields got removed (--report)
+# --------------------------------------------------------------------------- #
+def _inventory_metadata(data: bytes, fmt: Optional[str],
+                        keep_icc: bool = False,
+                        drop_orientation: bool = False) -> list:
+    """Names of the metadata this wipe will remove from `data`, per
+    format. Fills --report; mirrors what each stripper actually drops."""
+    if fmt is None:
+        return []
+    items = []
+    if fmt in ("jpeg", "mpo"):
+        items += _jpeg_metadata_segments(data, keep_icc)
+        if piexif is not None:
+            try:
+                ifd = piexif.load(data)
+                for k, d in ifd.items():
+                    if d and k != "thumbnail":
+                        for tag in d:
+                            name = None
+                            try:
+                                name = piexif.TAGS.get(
+                                    k, {}).get(tag, {}).get("name")
+                            except Exception:
+                                name = None
+                            name = name or _TIFF_IDENTIFYING.get(tag)
+                            if name:
+                                items.append(
+                                    f"EXIF:{k} {name} (0x{tag:04X})")
+                            else:
+                                items.append(f"EXIF:{k} tag 0x{tag:04X}")
+            except Exception:
+                pass
+    elif fmt == "png":
+        pos, n = 8, len(data)
+        iend = False
+        while pos + 8 <= n:
+            clen = int.from_bytes(data[pos:pos + 4], "big")
+            if pos + 12 + clen > n:
+                break
+            ctype = data[pos + 4:pos + 8]
+            if ctype == b"IEND":
+                iend = True
+            elif iend:
+                items.append("data-after-IEND")
+            if ctype in (b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"iCCP",
+                         b"pHYs"):
+                if not (ctype == b"iCCP" and keep_icc):
+                    items.append(ctype.decode())
+            pos += 12 + clen
+    elif fmt == "webp":
+        pos, n = 12, len(data)
+        while pos + 8 <= n:
+            tag = data[pos:pos + 4]
+            size = int.from_bytes(data[pos + 4:pos + 8], "little")
+            if tag == b"ICCP" and keep_icc:
+                pass
+            elif tag in (b"EXIF", b"XMP ", b"ICCP"):
+                items.append(tag.strip().decode())
+            if size > n:
+                break
+            pos += 8 + size + (size & 1)
+    elif fmt == "gif":
+        ncom = data.count(b"\x21\xfe")
+        if ncom:
+            items.append(f"{ncom} comment extension(s)")
+        if b"XMP Data" in data:
+            items.append("XMP application extension")
+    elif fmt in ("tiff",) + tuple(RAW_FORMATS):
+        items = _tiff_inventory(data, keep_icc, drop_orientation)
+    elif fmt in ("heif", "avif"):
+        ext = _heif_metadata_extents(data)
+        if ext:
+            items.append(f"{len(ext)} EXIF/XMP item extent(s)")
+    elif fmt == "raf":
+        if any(b not in (0, 32) for b in data[0x14:0x40]):
+            items.append("header serial + camera model")
+        if len(data) >= 0x5c:
+            jpos = int.from_bytes(data[0x54:0x58], "big")
+            jlen = int.from_bytes(data[0x58:0x5c], "big")
+            if jpos and jlen and jpos + jlen <= len(data) \
+                    and _jpeg_metadata_segments(data[jpos:jpos + jlen]):
+                items.append("embedded JPEG preview EXIF")
+        if len(data) >= 0x6c:
+            foff = int.from_bytes(data[0x64:0x68], "big")
+            flen = int.from_bytes(data[0x68:0x6c], "big")
+            if foff and flen and foff + flen <= len(data):
+                for nm in _tiff_find_identifying(data[foff:foff + flen]):
+                    items.append(f"FujiIFD:{nm}")
+    # dedupe, keep order
+    seen, out = set(), []
+    for n in items:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _print_report(path: Path, items: list) -> None:
+    """Print the --report block for one file."""
+    if not items:
+        print(f"  {c_dim('[report]')} {c_head(str(path))}: "
+              f"{c_ok('nothing to remove (already clean)')}")
+        return
+    print(f"  {c_dim('[report]')} {c_head(str(path))}:")
+    for it in items[:200]:
+        print(f"    - {c_warn(it)}")
+    if len(items) > 200:
+        print(f"    ... and {len(items) - 200} more")
+
+
+# --------------------------------------------------------------------------- #
 # driver
 # --------------------------------------------------------------------------- #
 def _refuse_system_target(path: Path) -> None:
@@ -2476,6 +2622,7 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
         return R_SKIP
 
     no_clobber = bool(getattr(args, "no_clobber", False))
+    want_report = bool(getattr(args, "report", False))
     drop_orientation = bool(getattr(args, "drop_orientation", False))
     perturb = getattr(args, "perturb", None)
 
@@ -2483,6 +2630,9 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
         # Fuji RAF is NOT a TIFF container, but it is writable losslessly:
         # header strings + embedded JPEG preview EXIF + FujiIFD block.
         # Never rebuilt from pixels; loud refusal when it can't be verified.
+        report = (_inventory_metadata(path.read_bytes(), "raf",
+                                      args.keep_icc)
+                  if want_report else None)
         if args.dry_run or args.inspect:
             try:
                 st = path.stat()
@@ -2490,6 +2640,8 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
                       "bytes — surgery would blank header model/serial, "
                       "strip the embedded JPEG preview's EXIF and clean "
                       "the FujiIFD block")
+                if want_report:
+                    _print_report(path, report or [])
             except OSError as e:
                 print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}",
                       file=sys.stderr)
@@ -2503,6 +2655,8 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
                     "not a parseable RAF container (truncated header or "
                     "unparseable embedded preview) — refusing to guess")
             write_output(path, args.output, cleaned, no_clobber=no_clobber)
+            if want_report:
+                _print_report(path, report or [])
         except Exception as e:
             print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
             return R_ERR
@@ -2511,12 +2665,17 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
     if fmt in RAW_FORMATS:
         # RAW: NEVER pixel-rebuild (the sensor data can't be re-encoded) —
         # lossless in-place IFD surgery only, loud refusal on failure
+        report = (_inventory_metadata(path.read_bytes(), fmt, args.keep_icc,
+                                      drop_orientation)
+                  if want_report else None)
         if args.dry_run or args.inspect:
             try:
                 st = path.stat()
                 print(f"  {c_info(fmt.upper())} {c_head(path.name)}: "
                       f"{st.st_size:,} bytes, TIFF-family container — "
                       "surgery would blank EXIF/GPS/MakerNotes losslessly")
+                if want_report:
+                    _print_report(path, report or [])
             except OSError as e:
                 print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
                 return R_ERR
@@ -2530,13 +2689,23 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
                     "not a parseable TIFF container — refusing to rebuild "
                     "RAW sensor data (BigTIFF/encrypted/corrupt?)")
             write_output(path, args.output, cleaned, no_clobber=no_clobber)
+            if want_report:
+                _print_report(path, report or [])
         except Exception as e:
             print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
             return R_ERR
         return R_OK
 
     if fmt in IMAGE_FORMATS:
+        report = [] if want_report else None
         if args.dry_run or args.inspect:
+            if want_report:
+                try:
+                    _print_report(path, _inventory_metadata(
+                        path.read_bytes(), fmt, args.keep_icc,
+                        drop_orientation))
+                except OSError:
+                    pass
             try:
                 inspect_image(path, max_pixels=getattr(args, "max_pixels", None))
             except Exception as e:
@@ -2547,9 +2716,11 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
             cleaned, fmt_out = strip_image_bytes(
                 path, keep_icc=args.keep_icc,
                 max_pixels=getattr(args, "max_pixels", None),
-                drop_orientation=drop_orientation,
+                report=report, drop_orientation=drop_orientation,
                 perturb=perturb)
             write_output(path, args.output, cleaned, no_clobber=no_clobber)
+            if want_report:
+                _print_report(path, report or [])
         except Exception as e:
             print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
             return R_ERR
@@ -2763,6 +2934,9 @@ def build_parser() -> argparse.ArgumentParser:
                         f"(default {DEFAULT_MAX_PIXELS:,}; 0 = unlimited)")
     p.add_argument("--no-clobber", action="store_true",
                    help="refuse to overwrite an existing -o target")
+    p.add_argument("--report", action="store_true",
+                   help="print exactly which metadata fields were removed "
+                        "per file (also works with --dry-run)")
     p.add_argument("--drop-orientation", action="store_true",
                    help="RAW/TIFF only: also blank the Orientation tag "
                         "(kept by default — display instruction, not identity)")

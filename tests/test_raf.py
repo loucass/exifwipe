@@ -80,3 +80,13 @@ def test_raf_handle_one_end_to_end(tmp_path, capsys):
     out = src.read_bytes()
     assert b"FinePix S3Pro" not in out
     assert b"FA392001" not in out
+
+
+def test_raf_report(tmp_path, capsys):
+    src = raf_fixture(tmp_path / "rp.raf")
+    args = exifwipe.build_parser().parse_args([str(src), "--report"])
+    assert exifwipe.handle_one(src, args) == exifwipe.R_OK
+    out = capsys.readouterr().out
+    assert "[report]" in out
+    assert "serial + camera model" in out
+    assert "embedded JPEG preview EXIF" in out
