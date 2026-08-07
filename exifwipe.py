@@ -560,22 +560,30 @@ def strip_pdf_bytes(path: Path) -> bytes:
         )
         return b""
 
-    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
-        try:
-            # pikepdf: assigning None to a Root property removes that key.
-            # This nukes the XMP metadata stream entirely.
-            if "/Metadata" in pdf.Root:
-                pdf.Root.Metadata = None
-        except Exception:
-            pass
-        try:
-            # /Info (DocInfo) holds title/author/creator/date...
-            pdf.docinfo = pikepdf.Dictionary()
-        except Exception:
-            pass
-        buf = io.BytesIO()
-        pdf.save(buf)
-        return buf.getvalue()
+    try:
+        with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+            try:
+                # pikepdf: assigning None to a Root property removes that key.
+                # This nukes the XMP metadata stream entirely.
+                if "/Metadata" in pdf.Root:
+                    pdf.Root.Metadata = None
+            except Exception:
+                pass
+            try:
+                # /Info (DocInfo) holds title/author/creator/date...
+                pdf.docinfo = pikepdf.Dictionary()
+            except Exception:
+                pass
+            buf = io.BytesIO()
+            pdf.save(buf)
+            return buf.getvalue()
+    except Exception as e:
+        print(
+            f"  {c_err('[ERR]')} {c_warn(path.name)}: "
+            f"PDF strip failed: {e}",
+            file=sys.stderr,
+        )
+        return b""
 
 
 # --------------------------------------------------------------------------- #
