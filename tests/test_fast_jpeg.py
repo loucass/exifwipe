@@ -1,12 +1,13 @@
 """JPEG fast path: orientation + dimensions come off the marker stream,
-so the common orientation-neutral case never decodes a pixel; plus
-vendor-based RAW detection from MakerNotes for extensionless RAWs."""
+so the common orientation-neutral case never decodes a pixel; vendor-
+based RAW detection from MakerNotes; and --drop-orientation for the
+TIFF family."""
 
 import io
 
 import exifwipe
 from helpers import (assert_jpeg_clean, dng_fixture, jpeg_with_exif,
-                     nef_like_fixture)
+                     nef_like_fixture, tiff_with_orientation)
 from PIL import Image
 
 
@@ -88,3 +89,38 @@ def test_plain_tiff_untouched_by_vendor_detection(tmp_path):
     from helpers import multipage_tiff
     src = multipage_tiff(tmp_path / "scan.bin")
     assert exifwipe._sniff_format(src) == "tiff"
+
+
+# -- --drop-orientation ------------------------------------------------------ #
+def test_drop_orientation(tmp_path):
+    src = tiff_with_orientation(tmp_path / "o.tiff", orient=6)
+    raw = src.read_bytes()
+    kept = exifwipe._tiff_strip_lossless(raw)
+    dropped = exifwipe._tiff_strip_lossless(raw, drop_orientation=True)
+    assert kept != dropped
+    bo, magic = exifwipe._tiff_parse_header(kept)
+
+    def ori_bytes(d, b, m):
+        for (p, tag, typ, cnt, vf) in exifwipe._iter_tiff_entries(d, b, m):
+            if tag == 0x0112:
+                return d[vf:vf + 2]
+        return None
+    assert ori_bytes(kept, bo, magic) == (6).to_bytes(2, "little"), \
+        "orientation kept by default"
+    dv = ori_bytes(dropped, bo, magic)
+    assert dv is not None and all(x in (32, 0) for x in dv), \
+        "orientation blanked with --drop-orientation"
+    # wipe is still complete either way
+    assert exifwipe._tiff_find_identifying(dropped) == []
+
+
+def test_drop_orientation_cli(tmp_path):
+    src = tiff_with_orientation(tmp_path / "o2.tiff", orient=6)
+    args = exifwipe.build_parser().parse_args([str(src), "--drop-orientation"])
+    assert exifwipe.handle_one(src, args) == exifwipe.R_OK
+    out = src.read_bytes()
+    bo, magic = exifwipe._tiff_parse_header(out)
+    for (p, tag, typ, cnt, vf) in exifwipe._iter_tiff_entries(out, bo, magic):
+        if tag == 0x0112:
+            assert all(x in (32, 0) for x in out[vf:vf + 2])
+            break

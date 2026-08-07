@@ -695,7 +695,8 @@ def _is_tiff_family(data: bytes) -> bool:
     return _tiff_parse_header(data) is not None
 
 
-def _tiff_strip_lossless(data: bytes, keep_icc: bool = False):
+def _tiff_strip_lossless(data: bytes, keep_icc: bool = False,
+                         drop_orientation: bool = False):
     """Lossless metadata surgery for TIFF-family containers (TIFF / DNG /
     CR2 / NEF / ARW / ORF / RW2 / PEF / SRW / SR2...).
 
@@ -706,6 +707,9 @@ def _tiff_strip_lossless(data: bytes, keep_icc: bool = False):
       * identifying scalar tags (Make, Model, Software, Artist, Copyright,
         ImageDescription, SerialNumber, DNG camera model / private data /
         original-raw blobs...) are blanked in place;
+      * Orientation (0x0112) is blanked only with drop_orientation (kept
+        by default: it's a display instruction, not identity, and RAW
+        pixels can't be re-rotated);
       * ICC (0x8773) is blanked unless keep_icc.
 
     Returns cleaned bytes, or None when the input isn't a parseable TIFF
@@ -756,7 +760,8 @@ def _tiff_strip_lossless(data: bytes, keep_icc: bool = False):
                     q += entry
                 block_end = min(q + off_size, len(out))
                 out[tgt:block_end] = b"\x00" * (block_end - tgt)
-        elif tag in _TIFF_BLANK or (tag == 0x8773 and not keep_icc):
+        elif tag in _TIFF_BLANK or (tag == 0x8773 and not keep_icc) \
+                or (tag == 0x0112 and drop_orientation):
             tsize = _TYPE_SIZE.get(typ)
             if tsize is None:
                 continue
@@ -960,6 +965,9 @@ def print_formats_matrix() -> None:
                       "preview/IFD"),
         ("bmp",       "pixel rebuild",
                       "clean"),
+        ("raw-orient", "Orientation kept (display-only, sensor can't be "
+                      "re-rotated); --drop-orientation blanks it",
+                      "opt-in removal"),
         ("pdf",       "pikepdf: /Info + /Metadata + /Lang/JS/PageLabels",
                       "BEST-EFFORT: embedded-image EXIF may survive"),
     ]
@@ -1065,7 +1073,8 @@ def _jpeg_sof_size(data: bytes):
 
 
 def strip_image_bytes(path: Path, keep_icc: bool = False,
-                      max_pixels: Optional[int] = None) -> tuple[bytes, str]:
+                      max_pixels: Optional[int] = None,
+                      drop_orientation: bool = False) -> tuple[bytes, str]:
     """Strip metadata, keeping pixels as close to byte-identical as the
     format allows.
 
@@ -1096,6 +1105,8 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
     `max_pixels` guards against decompression bombs: images larger than
     the limit (per frame, and a cumulative budget across animation
     frames) are refused loudly instead of being decoded into RAM.
+    `drop_orientation` additionally blanks the RAW/TIFF Orientation tag
+    (kept by default: display-only, sensor pixels can't be re-rotated).
 
     Returns (clean_bytes, output_format_lowercase).
     """
@@ -1106,7 +1117,7 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
     # data: every axis favors the surgery (pixels byte-identical, pages
     # kept, no encode cost).
     if raw[:4] in (b"II*\x00", b"MM\x00*") and _is_tiff_family(raw):
-        surg = _tiff_strip_lossless(raw, keep_icc)
+        surg = _tiff_strip_lossless(raw, keep_icc, drop_orientation)
         if surg is not None:
             return surg, "tiff"
         # unparseable TIFF: fall through to Pillow's rebuild as a last resort
@@ -2386,6 +2397,7 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
         return R_SKIP
 
     no_clobber = bool(getattr(args, "no_clobber", False))
+    drop_orientation = bool(getattr(args, "drop_orientation", False))
 
     if fmt == "raf":
         # Fuji RAF is NOT a TIFF container, but it is writable losslessly:
@@ -2431,7 +2443,8 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
             return R_OK
         try:
             cleaned = _tiff_strip_lossless(path.read_bytes(),
-                                           keep_icc=args.keep_icc)
+                                           keep_icc=args.keep_icc,
+                                           drop_orientation=drop_orientation)
             if cleaned is None:
                 raise RuntimeError(
                     "not a parseable TIFF container — refusing to rebuild "
@@ -2453,7 +2466,8 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
         try:
             cleaned, fmt_out = strip_image_bytes(
                 path, keep_icc=args.keep_icc,
-                max_pixels=getattr(args, "max_pixels", None))
+                max_pixels=getattr(args, "max_pixels", None),
+                drop_orientation=drop_orientation)
             write_output(path, args.output, cleaned, no_clobber=no_clobber)
         except Exception as e:
             print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
@@ -2668,6 +2682,9 @@ def build_parser() -> argparse.ArgumentParser:
                         f"(default {DEFAULT_MAX_PIXELS:,}; 0 = unlimited)")
     p.add_argument("--no-clobber", action="store_true",
                    help="refuse to overwrite an existing -o target")
+    p.add_argument("--drop-orientation", action="store_true",
+                   help="RAW/TIFF only: also blank the Orientation tag "
+                        "(kept by default — display instruction, not identity)")
     p.add_argument("--formats", action="store_true",
                    help="print what formats are guaranteed clean "
                       "vs best-effort, then exit")
