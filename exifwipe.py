@@ -584,9 +584,13 @@ def strip_pdf_bytes(path: Path) -> bytes:
 def write_output(src: Path, out: Optional[Path], cleaned: bytes) -> None:
     """Either overwrite src in place, or write to `out` (file or dir)."""
     if out is None:
-        # atomic-ish: write new inode, then rename over the original
+        # atomic-ish: write new inode, then rename over the original.
+        # Preserve mode + mtime so a 0600 private photo stays 0600.
+        st = src.stat()
         tmp = src.with_suffix(src.suffix + ".exifwipe_tmp")
         tmp.write_bytes(cleaned)
+        os.chmod(tmp, st.st_mode)
+        os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
         os.replace(tmp, src)
         print(f"  {c_ok('[STRIPPED]')} {c_head(str(src))}")
     else:
