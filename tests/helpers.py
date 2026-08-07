@@ -19,6 +19,70 @@ from exifwipe import _strip_gif_lossless  # noqa: F401  (used by some tests)
 # --------------------------------------------------------------------------- #
 # fixture builders
 # --------------------------------------------------------------------------- #
+def jpeg_with_exif(path, orient=1, progressive=False, icc=False, quality=90):
+    """A 96x64 JPEG with Make/Model/Copyright/UserComment/GPS EXIF."""
+    img = Image.new("RGB", (96, 64), (200, 30, 30))
+    exif = piexif.dump({
+        "0th": {0x010F: b"AttackerCam", 0x0112: orient, 0x0131: b"AcmeFW",
+                0x8298: b"LeakCopyright"},
+        "Exif": {0x9003: b"2024:01:02 03:04:05", 0x9286: b"LeakUserComment"},
+        "GPS": {1: b"N", 2: ((37, 1), (30, 1), (0, 1))},
+    })
+    kw = {"format": "JPEG", "exif": exif, "quality": quality}
+    if icc:
+        kw["icc_profile"] = b"fake-icc-profile-data-" * 4
+    if progressive:
+        kw["progressive"] = True
+    img.save(path, **kw)
+    return Path(path)
+
+
+def png_with_metadata(path):
+    """PNG with tEXt, iTXt, eXIf and iCCP chunks."""
+    img = Image.new("RGBA", (40, 30), (10, 200, 30, 255))
+    meta = PngInfo()
+    meta.add_text("Comment", "leaky comment")
+    meta.add_text("Software", "leaky software")
+    meta.add_itxt("International", "leaky iTXt", "xml:lang")
+    exif = piexif.dump({"0th": {0x010F: b"LeakCam"}})
+    img.save(path, pnginfo=meta, exif=exif, icc_profile=b"leak-icc")
+    return Path(path)
+
+
+def animated_gif(path, frames=3, comment_payload=b"hi there",
+                 xmp=True, loop=0):
+    """Animated GIF; comment + XMP app-ext are spliced in right before the
+    trailer (the position that used to leak), keeping the stream valid."""
+    imgs = [Image.new("RGB", (12, 12), (i * 60 % 255, 30, 40))
+            for i in range(frames)]
+    buf = io.BytesIO()
+    imgs[0].save(buf, format="GIF", save_all=True, append_images=imgs[1:],
+                 duration=[80 + i * 10 for i in range(frames)], loop=loop)
+    data = bytearray(buf.getvalue())
+    trailer = find_gif_trailer(data)
+    assert trailer is not None, "could not locate GIF trailer"
+    payload = bytearray()
+    if comment_payload is not None:
+        payload += b"\x21\xfe" + _subblocks(comment_payload)
+    if xmp:
+        payload += b"\x21\xff" + _subblocks(b"XMP DataXMP") + _subblocks(b"<x:xmpmeta>leak</x:xmpmeta>")
+    data[trailer:trailer] = payload
+    Path(path).write_bytes(bytes(data))
+    return Path(path)
+
+
+def animated_webp(path, frames=3, with_exif=True, with_xmp=True):
+    imgs = [Image.new("RGBA", (24, 18), (255, i * 60, 0, 255)) for i in range(frames)]
+    kw = {"save_all": True, "append_images": imgs[1:],
+          "duration": [100, 110, 120], "loop": 0}
+    if with_exif:
+        kw["exif"] = piexif.dump({"0th": {0x010F: b"LeakCam"}})
+    if with_xmp:
+        kw["xmp"] = b"<x:xmpmeta>leak-xmp</x:xmpmeta>"
+    imgs[0].save(path, format="WEBP", **kw)
+    return Path(path)
+
+
 def multipage_tiff(path, pages=3, tags=True):
     imgs = [Image.new("L", (20, 10 + i), i * 40) for i in range(pages)]
     buf = io.BytesIO()
@@ -29,6 +93,160 @@ def multipage_tiff(path, pages=3, tags=True):
     imgs[0].save(buf, format="TIFF", **kw)
     Path(path).write_bytes(buf.getvalue())
     return Path(path)
+
+
+def mpo_jpeg(path, second_exif=True):
+    """Two JPEGs concatenated (fake MPO); 2nd carries EXIF."""
+    a = io.BytesIO()
+    b = io.BytesIO()
+    Image.new("RGB", (32, 24), (200, 0, 0)).save(a, format="JPEG")
+    exif2 = piexif.dump({"0th": {0x0112: 1}, "Exif": {0x9286: b"LeakMe2"}})
+    Image.new("RGB", (32, 24), (0, 200, 0)).save(b, format="JPEG", exif=exif2)
+    Path(path).write_bytes(a.getvalue() + b.getvalue())
+    return Path(path)
+
+
+# --------------------------------------------------------------------------- #
+# forensic scanners (independent of exifwipe)
+# --------------------------------------------------------------------------- #
+def _subblocks(payload: bytes) -> bytes:
+    chunks = []
+    for i in range(0, len(payload), 200):
+        chunk = payload[i:i + 200]
+        chunks.append(bytes([len(chunk)]) + chunk)
+    chunks.append(b"\x00")
+    return b"".join(chunks)
+
+
+def find_gif_trailer(data: bytes):
+    """Return the index of the GIF trailer byte (0x3B) by walking the
+    block stream — the first 0x3B inside LZW data is NOT the trailer."""
+    n = len(data)
+    i = 6
+    if i + 7 > n:
+        return None
+    lsdesc = data[i:i + 7]
+    i += 7
+    if lsdesc[4] & 0x80:
+        i += 3 * (2 ** ((lsdesc[4] & 0x07) + 1))
+    while i < n:
+        b = data[i]
+        if b == 0x3B:
+            return i
+        if b == 0x2C:
+            packed = data[i + 9]
+            i += 10
+            if packed & 0x80:
+                i += 3 * (2 ** ((packed & 0x07) + 1))
+            i += 1  # LZW min code size
+            while i < n:
+                size = data[i]
+                i += 1 + size
+                if size == 0:
+                    break
+            continue
+        if b == 0x21:
+            i += 2
+            while i < n:
+                size = data[i]
+                i += 1 + size
+                if size == 0:
+                    break
+            continue
+        return None
+    return None
+
+
+def jpeg_segments(data: bytes):
+    """Return [(marker_byte, name)] for every APPn/COM in a JPEG."""
+    out = []
+    i, n = 2, len(data)
+    while i + 4 <= n:
+        if data[i] != 0xFF:
+            break
+        while i < n and data[i] == 0xFF:
+            i += 1
+        if i >= n:
+            break
+        marker = data[i]
+        i += 1
+        if marker == 0xDA:
+            break
+        if marker == 0xD9:
+            break
+        seg_len = int.from_bytes(data[i:i + 2], "big")
+        if seg_len < 2 or i + seg_len > n:
+            break
+        payload = data[i + 2:i + seg_len]
+        if marker == 0xFE:
+            out.append((0xFE, "COM"))
+        elif 0xE0 <= marker <= 0xEF:
+            name = payload[:8].split(b"\x00")[0].decode(errors="replace")
+            out.append((marker, f"APP{marker - 0xE0}:{name}"))
+        i += seg_len
+    return out
+
+
+def png_chunks(data: bytes):
+    out = []
+    pos = 8
+    n = len(data)
+    while pos + 8 <= n:
+        clen = int.from_bytes(data[pos:pos + 4], "big")
+        ctype = data[pos + 4:pos + 8]
+        out.append(ctype.decode(errors="replace"))
+        if ctype == b"IEND":
+            break
+        pos += 12 + clen
+    return out
+
+
+def assert_jpeg_clean(data: bytes, leak_strings=("Leak", "AttackerCam", "AcmeFW")):
+    assert data[:2] == b"\xff\xd8", "output is not a JPEG"
+    # no EXIF via piexif
+    ifd = piexif.load(data)
+    for k, v in ifd.items():
+        if k == "thumbnail":
+            continue
+        assert not v, f"EXIF IFD {k} not empty after wipe: {v}"
+    # no identifying APP segments (JFIF structural APP0 allowed)
+    segs = jpeg_segments(data)
+    for marker, name in segs:
+        if marker == 0xE0 and name.startswith("APP0:JFIF"):
+            continue  # structural
+        assert False, f"metadata segment survived: {name}"
+    for s in leak_strings:
+        assert s.encode() not in data, f"leak string {s!r} still in output"
+
+
+def assert_png_clean(data: bytes, leak_strings=("leak", "LeakCam")):
+    chunks = png_chunks(data)
+    assert "IEND" in chunks, "not a PNG"
+    for c in ("tEXt", "zTXt", "iTXt", "eXIf", "iCCP"):
+        assert c not in chunks, f"metadata chunk survived: {c}"
+    for s in leak_strings:
+        assert s.encode() not in data, f"leak string {s!r} still in output"
+
+
+def assert_gif_clean(data: bytes, leak_strings=(b"hi there", b"leak")):
+    assert data[:6] in (b"GIF87a", b"GIF89a")
+    assert b"\x21\xfe" not in data, "comment extension survived"
+    for s in leak_strings:
+        assert s not in data, f"leak payload {s!r} survived"
+
+
+def assert_webp_clean(data: bytes, leak_strings=(b"LeakCam", b"leak-xmp")):
+    assert data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+    pos, n = 12, len(data)
+    while pos + 8 <= n:
+        tag = data[pos:pos + 4]
+        size = int.from_bytes(data[pos + 4:pos + 8], "little")
+        assert tag not in (b"EXIF", b"XMP "), f"metadata chunk survived: {tag}"
+        if size > n:
+            break
+        pos += 8 + size + (size & 1)
+    for s in leak_strings:
+        assert s not in data, f"leak payload {s!r} survived"
 
 
 # --------------------------------------------------------------------------- #
@@ -278,6 +496,39 @@ def dng_fixture(path, with_leak=True):
             break
         p += 12
     Path(path).write_bytes(data)
+    return Path(path)
+
+
+def animated_png(path, frames=3):
+    """APNG with 3 frames and a tEXt metadata chunk."""
+    imgs = [Image.new("RGBA", (20, 14), (255, i * 70, 0, 255))
+            for i in range(frames)]
+    meta = PngInfo()
+    meta.add_text("Comment", "apng-leak")
+    imgs[0].save(path, format="PNG", save_all=True, append_images=imgs[1:],
+                 duration=[90, 100, 110], loop=0, pnginfo=meta)
+    return Path(path)
+
+
+def lossless_webp(path):
+    """Lossless WebP with EXIF/XMP chunks."""
+    img = Image.new("RGBA", (26, 18), (10, 200, 30, 255))
+    img.save(path, format="WEBP", lossless=True, quality=100,
+             exif=b"\x00\x00\x00\x00lossless-leak",
+             xmp=b"<x:xmpmeta>lossless-xmp</x:xmpmeta>")
+    return Path(path)
+
+
+def mpo_rotated_first(path):
+    """Multi-frame JPEG whose FIRST frame carries orientation 6 (the
+    round-2 case that silently deleted frame 2)."""
+    a = io.BytesIO()
+    b = io.BytesIO()
+    exif_a = piexif.dump({"0th": {0x010F: b"CamA", 0x0112: 6}})
+    Image.new("RGB", (40, 24), (200, 0, 0)).save(a, format="JPEG", exif=exif_a)
+    exif_b = piexif.dump({"0th": {0x0112: 1}, "Exif": {0x9286: b"Frame2Leak"}})
+    Image.new("RGB", (40, 24), (0, 200, 0)).save(b, format="JPEG", exif=exif_b)
+    Path(path).write_bytes(a.getvalue() + b.getvalue())
     return Path(path)
 
 

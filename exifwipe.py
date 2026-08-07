@@ -163,6 +163,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import stat
 import sys
 from pathlib import Path
 from typing import Iterable, Optional
@@ -271,23 +272,44 @@ DOC_EXTS = {".pdf"}  # pikepdf dep — see strip_pdf_metadata()
 # result codes for handle_one(): OK / ERROR / SKIPPED (unrecognized)
 R_OK, R_ERR, R_SKIP = 0, 1, 2
 
+# raster formats handled by the pixel-rebuild path
+RASTER_FORMATS = ("jpeg", "png", "gif", "tiff", "webp", "bmp", "heif", "avif")
+IMAGE_FORMATS = RASTER_FORMATS  # dispatch alias
+
 # TIFF-family RAW containers. These are NEVER pixel-rebuilt — the sensor
 # data can't be re-encoded — they get lossless in-place IFD surgery
 # (EXIF/GPS IFDs emptied, identifying tags blanked, pixel bytes untouched).
 RAW_FORMATS = ("dng", "cr2", "nef", "arw", "orf", "rw2", "pef", "srw",
                "sr2", "3fr")
 RAW_EXTENSIONS = frozenset("." + f for f in RAW_FORMATS)
+SUPPORTED_FORMATS = IMAGE_FORMATS + RAW_FORMATS
+
+# guard against decompression bombs: refuse anything above this many pixels
+# (Pillow's own DecompressionBombError threshold is ~2x this). 0 = unlimited.
+DEFAULT_MAX_PIXELS = 178_000_000
+
+# top-level system directories we refuse to write into, so a stray -o can't
+# drop an image into /etc or /usr by accident.
+_SYSTEM_DIRS = {"etc", "usr", "bin", "sbin", "lib", "lib64", "boot",
+                "proc", "sys", "dev", "run"}
 
 
 # --------------------------------------------------------------------------- #
 # inspection — print what exiftool would surface
 # --------------------------------------------------------------------------- #
-def inspect_image(path: Path) -> None:
+def inspect_image(path: Path, max_pixels: Optional[int] = None) -> None:
     """Print the metadata fields ExifTool would surface on this image."""
+    if max_pixels is None:
+        max_pixels = DEFAULT_MAX_PIXELS
     print(f"\n{c_head('=' * 3)} {c_head(path.name)} {c_head('=' * 3)}")
     with Image.open(path) as img:
+        w, h = img.size
         print(f"  {c_info('format')}={img.format}  {c_info('mode')}={img.mode}  "
-              f"{c_info('size')}={img.size[0]}x{img.size[1]}")
+              f"{c_info('size')}={w}x{h}")
+        if max_pixels and w * h > max_pixels:
+            print(f"  {c_warn(f'too large to inspect in detail '
+                              f'({w*h:,}px > {max_pixels:,} limit)')}")
+            return
 
         exif = img.getexif() if hasattr(img, "getexif") else None
         if not exif:
@@ -320,6 +342,41 @@ def exiftool_hint() -> str:
 # --------------------------------------------------------------------------- #
 # verification — prove nothing leaked before/after a wipe, or refuse
 # --------------------------------------------------------------------------- #
+_STRUCTURAL_KEYS = {
+    "SourceFile", "FileName", "Directory", "ExifToolVersion", "FileSize",
+    "FileModifyDate", "FileAccessDate", "FileInodeChangeDate", "FilePermissions",
+    "FileType", "FileTypeExtension", "MIMEType", "ImageWidth", "ImageHeight",
+    "BitDepth", "ColorType", "EncodingProcess", "Megapixels", "ImageSize",
+}
+# groups that are structural (color management / viewer hints), not identifying
+_STRUCTURAL_GROUPS = {"JFIF", "ICC_Profile", "Composite", "ExifTool", "File"}
+
+
+def _parse_exiftool_json(text: str) -> list:
+    """Turn `exiftool -j -a -G1 FILE` output into a list of leaked tag names.
+
+    Keys that are structural (file size, dimensions, JFIF, ICC...) are
+    ignored; everything else is a leak. Returns [] on unparseable output.
+    """
+    import json
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+    if not isinstance(data, list) or not data:
+        return []
+    obj = data[0] if isinstance(data[0], dict) else {}
+    leaks = []
+    for key in obj:
+        parts = key.split(":")
+        group = parts[0] if len(parts) > 1 else ""
+        tag = parts[-1]
+        if tag in _STRUCTURAL_KEYS or group in _STRUCTURAL_GROUPS:
+            continue
+        leaks.append(key)
+    return leaks
+
+
 def _verify_with_exiftool(path: Path) -> Optional[list]:
     """Run `exiftool` if present and return a list of leaked tag names
     (empty = clean). Returns None when exiftool is unavailable."""
@@ -330,24 +387,7 @@ def _verify_with_exiftool(path: Path) -> Optional[list]:
     import subprocess
     out = subprocess.run([exif, "-j", "-a", "-G1", str(path)],
                          capture_output=True, text=True).stdout
-    leaks = []
-    for line in out.splitlines():
-        line = line.strip().replace('"', "").replace(",", "")
-        # exiftool -j emits {"SourceFile": ..., "ExifTool": {...}, ...}
-        # anything with a real tag group (file/Exif ect) beyond the
-        # structural ones is a leak
-        if ": " not in line or line.startswith("{") or line.startswith("}"):
-            continue
-        key = line.split(":", 1)[0].strip()
-        if key.startswith(("SourceFile", "FileName", "Directory", "ExifTool",
-                           "FileSize", "FileModifyDate", "FileAccessDate",
-                           "FileInodeChangeDate", "FilePermissions", "FileType",
-                           "FileTypeExtension", "MIMEType", "ImageWidth",
-                           "ImageHeight", "BitDepth", "ColorType", "EncodingProcess",
-                           "Megapixels", "ImageSize")):
-            continue
-        leaks.append(key)
-    return leaks
+    return _parse_exiftool_json(out)
 
 
 # TIFF tags that are identifying (vs structural layout tags). Orientation
@@ -718,55 +758,64 @@ def _verify_bytes(path: Path, fmt: str) -> list:
     leaks = []
     data = path.read_bytes()
     if fmt == "jpeg":
-        if piexif is not None:
-            try:
-                ifd = piexif.load(data)
-                for k, d in ifd.items():
-                    if d:
-                        leaks.append(k)
-            except Exception:
-                pass
-        # also catch comment/APP segments a piexif round-trip can't see
-        i = 2
-        n = len(data)
-        while i + 4 <= n:
-            if data[i] != 0xFF:
-                break
-            while i < n and data[i] == 0xFF:
-                i += 1
-            if i >= n:
-                break
-            marker = data[i]; i += 1
-            if marker in (0xD8, 0xD9):
-                continue
-            if marker == 0xDA:
-                break
-            seg_len = int.from_bytes(data[i:i + 2], "big")
-            if seg_len < 2 or i + seg_len > n:
-                break
-            payload = data[i + 2:i + seg_len]
-            if marker == 0xFE:
-                leaks.append("COM")
-            elif 0xE0 <= marker <= 0xEF:
-                name = payload[:8].split(b"\x00")[0].decode(errors="replace")
-                if marker == 0xE0 and payload.startswith(b"JFIF"):
-                    pass  # structural, keep
-                elif marker == 0xE2 and payload.startswith(b"ICC_PROFILE\x00"):
-                    pass  # ICC if kept, structural
-                else:
-                    leaks.append(f"APP1x{name or hex(marker)}")
-            i += seg_len
+        # verify EVERY frame, not just the first — an MPO whose EXIF only
+        # lives in frame 2 used to sail through as "clean"
+        for frame in _split_jpeg_frames(data):
+            if piexif is not None:
+                try:
+                    ifd = piexif.load(frame)
+                    for k, d in ifd.items():
+                        if d and k != "thumbnail":
+                            leaks.append(k)
+                except Exception:
+                    pass
+            # also catch comment/APP segments a piexif round-trip can't see
+            i, n = 2, len(frame)
+            while i + 4 <= n:
+                if frame[i] != 0xFF:
+                    break
+                while i < n and frame[i] == 0xFF:
+                    i += 1
+                if i >= n:
+                    break
+                marker = frame[i]; i += 1
+                if marker == 0xDA:
+                    break
+                if marker == 0xD9:
+                    break
+                seg_len = int.from_bytes(frame[i:i + 2], "big")
+                if seg_len < 2 or i + seg_len > n:
+                    break
+                payload = frame[i + 2:i + seg_len]
+                if marker == 0xFE:
+                    leaks.append("COM")
+                elif 0xE0 <= marker <= 0xEF:
+                    if marker == 0xE0 and payload.startswith(b"JFIF"):
+                        pass  # structural, keep
+                    elif marker == 0xE2 and payload.startswith(b"ICC_PROFILE\x00"):
+                        pass  # ICC, structural (color management)
+                    else:
+                        name = payload[:8].split(b"\x00")[0].decode(errors="replace")
+                        leaks.append(f"APP{marker - 0xE0}:{name or hex(marker)}")
+                i += seg_len
     elif fmt == "png":
+        # scan the WHOLE file, including chunks past IEND — a tEXt tucked
+        # after the trailer used to be invisible to the verifier
         pos = 8
         n = len(data)
+        iend_seen = False
         while pos + 8 <= n:
             clen = int.from_bytes(data[pos:pos + 4], "big")
             ctype = data[pos + 4:pos + 8]
             if ctype == b"IEND":
-                break
+                iend_seen = True
+            elif iend_seen:
+                leaks.append("data-after-IEND")
             if ctype in (b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"pHYs", b"iCCP"):
                 leaks.append(ctype.decode())
             pos += 12 + clen
+        if pos != n:
+            leaks.append("trailing-bytes")
     elif fmt == "webp":
         pos = 12
         n = len(data)
@@ -792,6 +841,21 @@ def _verify_bytes(path: Path, fmt: str) -> list:
             leaks.append("EXIF box")
         if b"XMP " in data:
             leaks.append("XMP box")
+    elif fmt == "pdf":
+        try:
+            import pikepdf
+            with pikepdf.open(path) as pdf:
+                root = pdf.Root if pdf.Root is not None else {}
+                if "/Metadata" in root:
+                    leaks.append("XMP/Metadata")
+                if pdf.docinfo and len(pdf.docinfo) > 0:
+                    leaks.append("DocInfo")
+                for name in ("/Lang", "/OpenAction", "/PieceInfo",
+                             "/StructTreeRoot", "/PageLabels", "/MarkInfo"):
+                    if name in root:
+                        leaks.append(name.lstrip("/"))
+        except Exception:
+            leaks.append("unverifiable")
     return leaks
 
 
@@ -803,8 +867,9 @@ def verify_clean(path: Path) -> tuple[bool, list]:
         return True, []
     leaks = _verify_with_exiftool(path)
     if leaks is not None:
-        return (len(leaks) == 0, leaks)
-    return (len(_verify_bytes(path, fmt)) == 0, _verify_bytes(path, fmt))
+        return (not leaks, leaks)
+    leaks = _verify_bytes(path, fmt)
+    return (not leaks, leaks)
 
 
 def print_formats_matrix() -> None:
@@ -814,8 +879,13 @@ def print_formats_matrix() -> None:
                       "clean; pixels byte-identical when orientation-neutral"),
         ("jpeg-rot",  "orientation baked into pixels, q95 re-encode",
                       "clean (pixels re-encoded, not byte-identical)"),
+        ("mpo",       "per-SOI/EOI marker rewrite; rotated frame 0 "
+                      "re-encoded",
+                      "clean (all frames kept, trailing garbage dropped)"),
         ("png",       "fresh frame rebuild, empty PngInfo",
                       "clean"),
+        ("png-anim",  "lossless chunk strip (acTL/fcTL/fdAT kept)",
+                      "clean; APNG animation + pixels byte-identical"),
         ("gif",       "lossless byte rewrite: comments/XMP dropped",
                       "clean; frames/palette/loop byte-exact"),
         ("webp",      "frame rebuild; lossless-in -> lossless-out",
@@ -843,18 +913,23 @@ def print_formats_matrix() -> None:
 # --------------------------------------------------------------------------- #
 # core strip — image formats
 # --------------------------------------------------------------------------- #
-def _apply_orientation(img):
-    """Honor EXIF orientation so we don't undo a rotation the
-    photographer intended. Older Pillow used exif_transpose (still
-    works); current Pillow exposes exif_transpose via ImageOps."""
+def _apply_orientation(img, strict: bool = False):
+    """Honor EXIF orientation so we don't undo a rotation the photographer
+    intended. In strict mode (JPEG — where a wrong rotation is the most
+    damaging), fail loudly instead of silently saving a mis-rotated photo.
+    Other formats degrade to a plain copy when the EXIF is unreadable."""
     try:
         from PIL import ImageOps
         return ImageOps.exif_transpose(img)
-    except Exception:
+    except Exception as e:
+        if strict:
+            raise RuntimeError(
+                f"failed to bake EXIF orientation into pixels: {e}") from e
         return img
 
 
-def strip_image_bytes(path: Path, keep_icc: bool = False) -> tuple[bytes, str]:
+def strip_image_bytes(path: Path, keep_icc: bool = False,
+                      max_pixels: Optional[int] = None) -> tuple[bytes, str]:
     """Strip metadata, keeping pixels as close to byte-identical as the
     format allows.
 
@@ -867,10 +942,28 @@ def strip_image_bytes(path: Path, keep_icc: bool = False) -> tuple[bytes, str]:
     empty metadata block. The rebuild is tiled so memory stays bounded
     no matter the megapixel count.
 
-    Animated GIF / multipage TIFF keep every frame, timing and loop.
+    GIF: lossless byte-level rewrite first — drops comment + XMP
+    application extensions anywhere in the block stream and keeps every
+    frame, palette, transparency, disposal and the loop count
+    byte-exact. Falls back to a pixel rebuild if the stream is malformed.
+
+    TIFF family (incl. DNG/RAW when they reach this path): lossless
+    in-place IFD surgery — pixels byte-identical, pages kept.
+
+    Animated GIF / APNG / multipage TIFF / animated WebP keep every
+    frame, timing and loop (APNG + lossless WebP are stripped losslessly).
+    Animated AVIF is refused loudly. Multi-frame JPEG (MPO) with a
+    rotated frame 0 bakes the rotation in and keeps every other frame
+    lossless — never drops them.
+
+    `max_pixels` guards against decompression bombs: images larger than
+    the limit (per frame, and a cumulative budget across animation
+    frames) are refused loudly instead of being decoded into RAM.
 
     Returns (clean_bytes, output_format_lowercase).
     """
+    if max_pixels is None:
+        max_pixels = DEFAULT_MAX_PIXELS
     raw = path.read_bytes()
     # TIFF family -> lossless in-place surgery. NEVER re-encode sensor
     # data: pixels byte-identical, pages kept, no encode cost.
@@ -879,35 +972,74 @@ def strip_image_bytes(path: Path, keep_icc: bool = False) -> tuple[bytes, str]:
         if surg is not None:
             return surg, "tiff"
     with Image.open(path) as img:
-        img.load()
+        w, h = img.size
+        if max_pixels and w * h > max_pixels:
+            raise RuntimeError(
+                f"refusing to process {w}x{h} = {w*h:,} pixels "
+                f"(limit {max_pixels:,}); pass --max-pixels N to raise "
+                "the limit (memory risk)"
+            )
         fmt = (img.format or path.suffix.lstrip(".")).upper()
-
-        # animated GIF / multipage TIFF / animated WebP / AVIF —
-        # strip every frame, keep the animation
-        if fmt in ("GIF", "TIFF", "TIF", "WEBP", "AVIF") \
-                and getattr(img, "n_frames", 1) > 1:
-            return _strip_multiframe(img, fmt, keep_icc=keep_icc)
+        img.load()
+        n_frames = getattr(img, "n_frames", 1)
+        if max_pixels and n_frames > 1 and w * h * n_frames > max_pixels * 8:
+            # cumulative budget: a hostile "animation" with thousands of
+            # huge frames is a decompression bomb in slow motion
+            raise RuntimeError(
+                f"refusing: ~{w*h*n_frames:,} total pixels across "
+                f"{n_frames} frames (cumulative limit {max_pixels*8:,})"
+            )
 
         # GIF: prefer the byte-level strip — it keeps every frame,
         # palette, transparency and disposal EXACTLY as-is (no
-        # P→RGBA→re-quantize round-trip) and only drops comment +
-        # XMP application extensions. Fall back to rebuild if the
-        # stream doesn't parse.
+        # P→RGBA→re-quantize round-trip) and only drops comment + XMP
+        # application extensions wherever they appear in the stream.
+        # Fall back to a rebuild if the stream doesn't parse.
         if fmt == "GIF":
-            lossless = _strip_gif_lossless(path.read_bytes())
+            lossless = _strip_gif_lossless(raw)
             if lossless is not None:
                 return lossless, "gif"
+            if n_frames > 1:
+                return _strip_multiframe(img, fmt, keep_icc=keep_icc)
 
-        # JPEG: prefer the lossless marker-stream strip. Only when the
-        # photo is orientation-neutral — otherwise we must bake the
+        webp_lossless = fmt == "WEBP" and _webp_is_lossless(raw)
+
+        # animated/multipage WebP / TIFF / AVIF — strip every frame,
+        # keep the animation
+        if fmt in ("TIFF", "TIF", "WEBP", "AVIF") and n_frames > 1:
+            return _strip_multiframe(img, fmt, keep_icc=keep_icc,
+                                     webp_lossless=webp_lossless)
+
+        # APNG: lossless chunk strip (animation + pixels byte-exact).
+        # The old code rebuilt through the single-frame path and silently
+        # collapsed every animated PNG to frame 1.
+        if fmt == "PNG" and _png_is_animated(raw):
+            lossless = _strip_png_lossless(raw)
+            if lossless is not None:
+                return lossless, "png"
+            if n_frames > 1:
+                return _strip_multiframe(img, "PNG", keep_icc=keep_icc)
+
+        # JPEG / MPO: prefer the lossless marker-stream strip. Only when
+        # the photo is orientation-neutral — otherwise we must bake the
         # rotation into the pixels, which requires re-encoding.
         if fmt in ("JPEG", "JPG", "MPO"):
+            n_jpeg = raw.count(b"\xff\xd8")
+            if n_jpeg > 1 and not _orientation_is_neutral(img):
+                # rotated multi-frame (MPO): bake frame 0's rotation,
+                # keep every other frame lossless — NEVER drop them
+                mpo = _strip_mpo_rotated_first(raw, img, keep_icc)
+                if mpo is None:
+                    raise RuntimeError(
+                        "multi-frame JPEG needs rotation but its frames "
+                        "could not be split — refusing to drop them")
+                return mpo, "jpeg"
             if _orientation_is_neutral(img):
-                lossless = _strip_jpeg_lossless(path.read_bytes(), keep_icc)
+                lossless = _strip_jpeg_lossless(raw, keep_icc)
                 if lossless is not None:
-                    return _jpeg_final_check(lossless), "jpeg"
+                    return _jpeg_final_check(lossless, keep_icc), "jpeg"
 
-        img = _apply_orientation(img)
+        img = _apply_orientation(img, strict=fmt in ("JPEG", "JPG", "MPO"))
 
         mode = img.mode
         if mode not in ("RGB", "RGBA", "L"):
@@ -945,8 +1077,14 @@ def strip_image_bytes(path: Path, keep_icc: bool = False) -> tuple[bytes, str]:
             fmt_out = "PNG"
 
         elif fmt == "WEBP":
-            kwargs = {"format": "WEBP", "quality": 90, "method": 6,
-                      "exif": b"", "xmp": b"", "icc_profile": icc_bytes or None}
+            # lossless in -> lossless out: never silently downgrade a
+            # byte-exact file to q90 lossy
+            kwargs = {"format": "WEBP", "method": 6, "exif": b"",
+                      "xmp": b"", "icc_profile": icc_bytes or None}
+            if webp_lossless:
+                kwargs.update(lossless=True, quality=100, exact=True)
+            else:
+                kwargs["quality"] = 90
             clean.save(buf, **kwargs)
             fmt_out = "WEBP"
 
@@ -974,7 +1112,9 @@ def strip_image_bytes(path: Path, keep_icc: bool = False) -> tuple[bytes, str]:
 
         cleaned = buf.getvalue()
 
-    return _jpeg_final_check(cleaned), fmt_out.lower()
+    if fmt_out == "JPEG":
+        cleaned = _jpeg_final_check(cleaned, keep_icc)
+    return cleaned, fmt_out.lower()
 
 
 def _orientation_is_neutral(img) -> bool:
@@ -987,19 +1127,175 @@ def _orientation_is_neutral(img) -> bool:
         return True
 
 
-def _jpeg_final_check(cleaned: bytes) -> bytes:
-    """piexif round-trip verify ( JPEG only ) — the catch in imgproxy#668:
-    if any IFD came back non-empty after saving, re-wipe it."""
-    if piexif is not None:
+def _entropy_marker_index(data: bytes, j: int) -> int:
+    """From inside entropy-coded data, find the FF-run that precedes the
+    next real marker (handles FF 00 stuffing and RSTn). Returns the index
+    of the last FF of that run, or len(data) at EOF."""
+    n = len(data)
+    while j < n:
+        if data[j] != 0xFF:
+            j += 1
+            continue
+        k = j
+        while k < n and data[k] == 0xFF:
+            k += 1
+        if k >= n:
+            return n
+        nxt = data[k]
+        if nxt == 0x00 or 0xD0 <= nxt <= 0xD7:
+            j = k + 1
+            continue
+        return k - 1
+    return n
+
+
+def _split_jpeg_frames(data: bytes) -> list:
+    """Split a (possibly multi-frame) JPEG into SOI..EOI byte strings by
+    walking markers and skipping entropy-coded data. Tolerates garbage
+    between frames; a frame without an EOI runs to EOF. Returns [] on
+    input that doesn't even start with a SOI."""
+    frames = []
+    i, n = 0, len(data)
+    while i < n:
+        if data[i:i + 2] != b"\xff\xd8":
+            nxt = data.find(b"\xff\xd8", i, min(i + 64, n))
+            if nxt == -1:
+                break
+            i = nxt
+        start = i
+        j = i + 2
+        eoi = None
+        while j < n:
+            while j < n and data[j] != 0xFF:
+                j += 1
+            while j < n and data[j] == 0xFF:
+                j += 1
+            if j >= n:
+                break
+            marker = data[j]
+            j += 1
+            if marker == 0xD9:
+                eoi = j
+                break
+            if marker == 0xDA:
+                j = _entropy_marker_index(data, j)
+                continue
+            if 0xD0 <= marker <= 0xD7 or marker == 0x01:
+                continue
+            if j + 2 > n:
+                break
+            seg_len = int.from_bytes(data[j:j + 2], "big")
+            j += 2 + max(seg_len - 2, 0)
+        frames.append(data[start:eoi if eoi is not None else n])
+        if eoi is None:
+            break
+        i = eoi
+    return frames
+
+
+def _jpeg_metadata_segments(data: bytes, keep_icc: bool = False) -> list:
+    """Names of every non-structural APPn/COM segment in every frame
+    (JFIF APP0 and ICC APP2 — when keep_icc — are structural)."""
+    found = []
+    for frame in _split_jpeg_frames(data):
+        i, n = 2, len(frame)
+        while i + 4 <= n:
+            if frame[i] != 0xFF:
+                break
+            while i < n and frame[i] == 0xFF:
+                i += 1
+            if i >= n:
+                break
+            marker = frame[i]
+            i += 1
+            if marker == 0xDA or marker == 0xD9:
+                break
+            if i + 2 > n:
+                break
+            seg_len = int.from_bytes(frame[i:i + 2], "big")
+            if seg_len < 2 or i + seg_len > n:
+                break
+            payload = frame[i + 2:i + seg_len]
+            if marker == 0xFE:
+                found.append("COM")
+            elif 0xE0 <= marker <= 0xEF:
+                if marker == 0xE0 and payload.startswith(b"JFIF"):
+                    pass
+                elif marker == 0xE2 and keep_icc and payload.startswith(b"ICC_PROFILE\x00"):
+                    pass
+                else:
+                    name = payload[:8].split(b"\x00")[0].decode(errors="replace")
+                    found.append(f"APP{marker - 0xE0}:{name or hex(marker)}")
+            i += seg_len
+    return found
+
+
+def _jpeg_final_check(cleaned: bytes, keep_icc: bool = False) -> bytes:
+    """Round-trip verify, JPEG only. If any metadata segment survived the
+    wipe (a re-encode can sneak segments back in), re-run the lossless
+    stripper — and if THAT still leaves something, fail loudly instead of
+    handing back a dirty file.
+
+    (The old implementation leaned on piexif.remove(), which with
+    piexif 1.1.3 raises ValueError on bytes input — the exception was
+    swallowed, and the re-wipe never ran. The safety net was dead code.)"""
+    leftovers = _jpeg_metadata_segments(cleaned, keep_icc)
+    if not leftovers:
+        return cleaned
+    rewiped = _strip_jpeg_lossless(cleaned, keep_icc)
+    if rewiped is not None and not _jpeg_metadata_segments(rewiped, keep_icc):
+        return rewiped
+    raise RuntimeError(
+        "JPEG final check failed: metadata segments survived rewrite: "
+        + ", ".join(leftovers)
+    )
+
+
+def _rebuild_jpeg_from_img(img, keep_icc: bool = False) -> bytes:
+    """Bake orientation into pixels, rebuild a clean q95 JPEG frame."""
+    img = _apply_orientation(img, strict=True)
+    mode = img.mode
+    if mode not in ("RGB", "RGBA", "L"):
+        mode = "RGBA" if ("A" in mode or mode == "P") else "RGB"
+        img = img.convert(mode)
+    clean = _rebuild_frame(img, mode)
+    icc = b""
+    if keep_icc:
         try:
-            after = piexif.load(cleaned)
-            if any(after.get(k) for k in ("0th", "1st", "Exif", "GPS", "Interop")):
-                cleaned = piexif.remove(cleaned) or cleaned
+            icc = img.info.get("icc_profile", b"") or b""
         except Exception:
-            # piexif refuses to parse -> there's no EXIF container at all
-            # which is what we wanted all along
-            pass
-    return cleaned
+            icc = b""
+    buf = io.BytesIO()
+    clean.save(buf, format="JPEG", quality=95, optimize=True, exif=b"",
+               progressive=False, icc_profile=icc or None)
+    return _jpeg_final_check(buf.getvalue(), keep_icc)
+
+
+def _strip_mpo_rotated_first(raw: bytes, img, keep_icc: bool = False):
+    """Multi-frame JPEG whose FIRST frame carries a rotation: re-encode
+    frame 0 with the rotation baked in, then lossless-strip the remaining
+    frames so no frame is ever silently dropped. Returns None when the
+    stream can't be split (caller must refuse loudly, not guess)."""
+    frames = _split_jpeg_frames(raw)
+    if len(frames) < 2:
+        return None
+    f0 = frames[0]
+    rest = raw[len(f0):]
+    try:
+        img.seek(0)
+        clean0 = _rebuild_jpeg_from_img(img, keep_icc)
+    except Exception as e:
+        raise RuntimeError(
+            f"multi-frame JPEG needs rotation and frame 0 could not be "
+            f"re-encoded ({e}) — refusing to drop the other frames") from e
+    if rest:
+        rest_clean = _strip_jpeg_lossless(rest, keep_icc)
+        if rest_clean is None:
+            raise RuntimeError(
+                "multi-frame JPEG: trailing frames could not be parsed "
+                "losslessly — refusing to drop them")
+        return clean0 + rest_clean
+    return clean0
 
 
 def _strip_jpeg_lossless(data: bytes, keep_icc: bool = False):
@@ -1023,8 +1319,14 @@ def _strip_jpeg_lossless(data: bytes, keep_icc: bool = False):
     def scan_entropy(j: int) -> int:
         """Copy entropy-coded bytes verbatim until the next real
         marker. Returns the index of that marker (which the outer
-        loop then processes). Handles FF 00 stuffing and RSTn."""
+        loop then processes). Handles FF 00 stuffing and RSTn.
+
+        `start` tracks the first unconsumed entropy byte so every byte
+        up to a marker's FF-run is copied out — the classic bug here is
+        advancing past non-FF bytes without copying them, which emits a
+        structurally valid JPEG whose pixels are gone."""
         nonlocal out
+        start = j
         while j < n:
             if data[j] != 0xFF:
                 j += 1
@@ -1033,24 +1335,35 @@ def _strip_jpeg_lossless(data: bytes, keep_icc: bool = False):
             while k < n and data[k] == 0xFF:
                 k += 1
             if k >= n:                      # run of FF to EOF — truncated
-                out += data[j:k]
+                out += data[start:k]
                 return n
             nxt = data[k]
             if nxt == 0x00 or 0xD0 <= nxt <= 0xD7:
                 # stuffed FF 00, or RSTn restart marker — part of the
                 # entropy stream, keep byte-exact
-                out += data[j:k + 1]
-                j = k + 1
+                out += data[start:k + 1]
+                start = j = k + 1
                 continue
-            # first real marker after entropy
-            out += data[j:k]
-            return k - 1
+            # first real marker after entropy — the FF-run is the
+            # marker's padding and is emitted by the outer loop, so the
+            # entropy copy must stop BEFORE the run (copying it would
+            # duplicate the FFs and break byte-exactness)
+            out += data[start:j]
+            return j
+        out += data[start:j]                # entropy runs to EOF — truncated
         return n
 
     while i < n:
         if data[i] != 0xFF:
-            # trailing garbage after the last EOI — drop it
-            break
+            # non-marker byte — either trailing garbage after the final
+            # EOI (file-carving residue, drop it) or a stray byte between
+            # MPO frames. Peek a bounded distance for a new SOI; if one
+            # appears, skip the junk and keep parsing so no frame is lost.
+            nxt = data.find(b"\xff\xd8", i, min(i + 64, n))
+            if nxt == -1:
+                break
+            i = nxt
+            continue
         while i < n and data[i] == 0xFF:
             i += 1
         if i >= n:
@@ -1095,16 +1408,19 @@ def _strip_jpeg_lossless(data: bytes, keep_icc: bool = False):
 
 def _strip_gif_lossless(data: bytes):
     """Rewrite a GIF stream, dropping comment blocks (0x21 0xFE) and
-    XMP application extensions (0x21 0xFF 'XMP DataXMP'), keeping the
-    image/frame descriptors, palettes, transparency, disposal and loop
-    count byte-identical. Returns None if the stream doesn't parse.
+    XMP application extensions (0x21 0xFF carrying 'XMP Data') anywhere
+    in the block stream — before, between and after image frames. Every
+    frame descriptor, palette, transparency, disposal and loop count is
+    copied byte-identical. Bytes after the trailer are dropped. Returns
+    None if the stream doesn't parse (caller falls back to a rebuild).
 
     GIF blocks that can carry metadata:
-      0x21 0xFE ...   comment extension        — dropped
-      0x21 0xFF ...   application extension   — dropped only if it
-                        carries XMP; NETSCAPE loop is kept
+      0x21 0xFE ...   comment extension              — dropped
+      0x21 0xFF ...   application extension          — dropped if it
+                        carries XMP; NETSCAPE loop kept
       0x21 0xF9 ...   graphic control (disposal + transparency) — kept
-      0x2C ...        image data               — kept verbatim
+      0x2C ...        image descriptor + pixel data  — kept verbatim
+      0x3B ...        trailer                        — end of file
     """
     if data[:6] not in (b"GIF87a", b"GIF89a"):
         return None
@@ -1124,27 +1440,49 @@ def _strip_gif_lossless(data: bytes):
         i += gct_size
 
     while i < n:
-        if data[i] == 0x3B or data[i] == 0x2C:
-            # trailer or image descriptor — nothing left to scrub
-            # after an image block except more image blocks, so
-            # keep the rest verbatim
-            out += data[i:]
+        b = data[i]
+        if b == 0x3B:                       # trailer — official end
+            out += b"\x3b"
             return bytes(out)
-        if data[i] != 0x21:
-            return None                     # unknown top-level byte
-        if i + 2 > n:
-            return None
-        label = data[i + 1]
-        start = i
-        i = _skip_gif_subblocks(data, i + 2)
-        if i is None:
-            return None
-        block = data[start:i]
-        if label == 0xFE:
-            continue                        # comment — drop
-        if label == 0xFF and block.startswith(b"\x21\xffXMP Data"):
-            continue                        # XMP application ext — drop
-        out += block                        # GCE / NETSCAPE / others
+        if b == 0x2C:                       # image descriptor
+            if i + 10 > n:
+                return None
+            packed = data[i + 9]
+            out += data[i:i + 10]
+            i += 10
+            if packed & 0x80:               # local color table
+                lct_size = 3 * (2 ** ((packed & 0x07) + 1))
+                if i + lct_size > n:
+                    return None
+                out += data[i:i + lct_size]
+                i += lct_size
+            if i >= n:
+                return None
+            out += data[i:i + 1]            # LZW minimum code size
+            i += 1
+            i = _copy_gif_subblocks(data, i, out)   # pixel data, verbatim
+            if i is None:
+                return None
+            continue
+        if b == 0x21:                       # extension
+            if i + 2 > n:
+                return None
+            label = data[i + 1]
+            start = i
+            end = _skip_gif_subblocks(data, i + 2)
+            if end is None:
+                return None
+            if label == 0xFE:
+                i = end                     # comment — dropped
+                continue
+            block = data[start:end]
+            if label == 0xFF and b"XMP Data" in block:
+                i = end                     # XMP application ext — dropped
+                continue
+            out += block                    # GCE / NETSCAPE / others — kept
+            i = end
+            continue
+        return None                         # unknown top-level byte
     return bytes(out)
 
 
@@ -1162,6 +1500,22 @@ def _skip_gif_subblocks(data: bytes, idx: int):
         idx += 1 + size
 
 
+def _copy_gif_subblocks(data: bytes, idx: int, out: bytearray):
+    """Copy a GIF sub-block chain (pixel data) verbatim into `out`.
+    Returns the index just past the chain; None if malformed."""
+    n = len(data)
+    while True:
+        if idx >= n:
+            return None
+        size = data[idx]
+        if idx + 1 + size > n:
+            return None
+        out += data[idx:idx + 1 + size]
+        idx += 1 + size
+        if size == 0:
+            return idx
+
+
 def _rebuild_frame(img, mode: str):
     """Copy pixels into a brand-new image, one bounded tile at a time,
     so a 100MP photo never materializes a giant Python list in RAM."""
@@ -1176,8 +1530,78 @@ def _rebuild_frame(img, mode: str):
     return clean
 
 
-def _strip_multiframe(img, fmt: str, keep_icc: bool = False) -> tuple[bytes, str]:
-    """Rebuild every frame of an animated GIF / multipage TIFF /
+_PNG_SIG = b"\x89PNG\r\n\x1a\n"
+
+
+def _png_is_animated(data: bytes) -> bool:
+    """True when the PNG stream carries an acTL (animation control) chunk."""
+    if data[:8] != _PNG_SIG:
+        return False
+    pos, n = 8, len(data)
+    while pos + 8 <= n:
+        clen = int.from_bytes(data[pos:pos + 4], "big")
+        if pos + 12 + clen > n:
+            break
+        ctype = data[pos + 4:pos + 8]
+        if ctype == b"acTL":
+            return True
+        if ctype == b"IDAT":
+            break          # acTL must precede the image data
+        pos += 12 + clen
+    return False
+
+
+def _strip_png_lossless(data: bytes):
+    """Drop PNG metadata chunks (tEXt/zTXt/iTXt/eXIf/iCCP/pHYs) and
+    anything after IEND, keeping every other chunk — including the acTL /
+    fcTL / fdAT animation blocks and IDAT pixel data — byte-identical.
+    Returns None when the chunk stream is malformed."""
+    if data[:8] != _PNG_SIG:
+        return None
+    DROP = {b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"iCCP", b"pHYs"}
+    out = bytearray(data[:8])
+    pos, n = 8, len(data)
+    iend = False
+    while pos + 8 <= n:
+        clen = int.from_bytes(data[pos:pos + 4], "big")
+        if clen > n or pos + 12 + clen > n:
+            return None
+        ctype = data[pos + 4:pos + 8]
+        if ctype == b"IEND":
+            out += data[pos:pos + 12 + clen]
+            iend = True
+            break
+        if ctype not in DROP:
+            out += data[pos:pos + 12 + clen]
+        pos += 12 + clen
+    if not iend:
+        return None
+    return bytes(out)
+
+
+def _webp_is_lossless(data: bytes) -> bool:
+    """True when a WebP's image data is a VP8L (lossless) chunk rather
+    than a VP8 (lossy) chunk. VP8X containers carry the VP8L/VP8 chunk
+    as a top-level sibling, so one flat chunk scan suffices."""
+    if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return False
+    pos, n = 12, len(data)
+    while pos + 8 <= n:
+        tag = data[pos:pos + 4]
+        size = int.from_bytes(data[pos + 4:pos + 8], "little")
+        if size > n:
+            break
+        if tag == b"VP8L":
+            return True
+        if tag == b"VP8 ":
+            return False
+        pos += 8 + size + (size & 1)
+    return False
+
+
+def _strip_multiframe(img, fmt: str, keep_icc: bool = False,
+                      webp_lossless: bool = False) -> tuple[bytes, str]:
+    """Rebuild every frame of an animated GIF / APNG / multipage TIFF /
     animated WebP / AVIF from pixels, dropping all per-frame metadata."""
     n = getattr(img, "n_frames", 1)
     frames, durations, disposal = [], [], []
@@ -1197,6 +1621,11 @@ def _strip_multiframe(img, fmt: str, keep_icc: bool = False) -> tuple[bytes, str
                        duration=durations, disposal=disposal,
                        loop=int(img.info.get("loop", 0) or 0))
         fmt_out = "GIF"
+    elif fmt == "PNG":
+        frames[0].save(buf, format="PNG", save_all=True,
+                       append_images=frames[1:], duration=durations,
+                       loop=int(img.info.get("loop", 0) or 0))
+        fmt_out = "PNG"
     elif fmt == "TIFF":
         frames[0].save(buf, format="TIFF", save_all=True, append_images=frames[1:])
         fmt_out = "TIFF"
@@ -1204,9 +1633,6 @@ def _strip_multiframe(img, fmt: str, keep_icc: bool = False) -> tuple[bytes, str
         # WebP supports a duration list; AVIF sequences exist but
         # pillow-heif doesn't provide an animated save — refuse loudly.
         if fmt == "AVIF":
-            # check whether the installed libwebp/avif plugin can write
-            # an animation; if not, fail with a clear error instead of
-            # silently collapsing to a single frame.
             raise RuntimeError(
                 "animated AVIF cannot be rewritten losslessly — "
                 "exifwipe refuses to destroy the animation; re-save "
@@ -1216,6 +1642,8 @@ def _strip_multiframe(img, fmt: str, keep_icc: bool = False) -> tuple[bytes, str
                   "append_images": frames[1:], "duration": durations,
                   "loop": int(img.info.get("loop", 0) or 0),
                   "exif": b"", "xmp": b""}
+        if webp_lossless:
+            common.update(lossless=True, quality=100, exact=True)
         if keep_icc:
             icc = img.info.get("icc_profile")
             if icc:
@@ -1224,7 +1652,7 @@ def _strip_multiframe(img, fmt: str, keep_icc: bool = False) -> tuple[bytes, str
         fmt_out = "WEBP"
     else:
         raise RuntimeError(f"multi-frame save not supported for {fmt}")
-    return buf.getvalue(), fmt_out
+    return buf.getvalue(), fmt_out.lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -1249,22 +1677,21 @@ def strip_pdf_bytes(path: Path) -> bytes:
 
     try:
         with pikepdf.open(path, allow_overwriting_input=True) as pdf:
-            try:
-                # pikepdf: assigning None to a Root property removes that key.
-                # This nukes the XMP metadata stream entirely.
-                if "/Metadata" in pdf.Root:
-                    pdf.Root.Metadata = None
-            except Exception:
-                pass
+            root = pdf.Root
+            if root is not None:
+                for key in ("/Metadata", "/Lang", "/OpenAction", "/PieceInfo",
+                            "/StructTreeRoot", "/PageLabels", "/MarkInfo"):
+                    try:
+                        if key in root:
+                            del root[key]  # pikepdf: del removes the key
+                    except Exception:
+                        pass
             try:
                 # /Info (DocInfo) holds title/author/creator/date...
-                # pikepdf requires the new value to be an INDIRECT object,
-                # otherwise assignment silently raises ValueError. Clearing
-                # to an empty indirect dictionary removes every /Info key.
+                # Clearing to an empty indirect dictionary removes every
+                # /Info key.
                 pdf.docinfo = pdf.make_indirect(pikepdf.Dictionary())
             except Exception:
-                # if that failed the /Info must still be replaced — delete
-                # the trailer key outright as a fallback
                 try:
                     del pdf.trailer["/Info"]
                 except Exception:
@@ -1283,14 +1710,40 @@ def strip_pdf_bytes(path: Path) -> bytes:
 # --------------------------------------------------------------------------- #
 # driver
 # --------------------------------------------------------------------------- #
+def _refuse_system_target(path: Path) -> None:
+    """Refuse to write into top-level system directories so a stray -o
+    can't drop an image into /etc or /usr. /tmp, /var, /home and
+    /run/media (USB mounts) are fine."""
+    try:
+        parts = path.resolve().parts
+    except Exception:
+        return
+    if len(parts) > 1 and parts[1] in _SYSTEM_DIRS:
+        # /run/media/<user>/... is a legitimate removable-mount target
+        if parts[1] == "run" and len(parts) > 2 and parts[2] == "media":
+            return
+        raise RuntimeError(
+            f"refusing to write into system directory '/{parts[1]}' ({path}); "
+            "use a user-writable location"
+        )
+
+
 def _atomic_write_bytes(path: Path, cleaned: bytes, st) -> None:
     """Write `cleaned` to `path` atomically via a private temp file that
     only we created (O_EXCL — no attacker can pre-plant a symlink at a
     predictable name), fsync it, then rename over the original.
 
+    A symlink is resolved FIRST so the write lands on the target — the
+    link itself is preserved (the old behavior replaced the symlink with
+    a regular file AND left the target dirty, which was both silent and
+    a leak).
+
     Mode and mtime of the original are preserved on the new inode so a
-    0600 private photo stays 0600.
+    0600 private photo stays 0600; setuid/setgid/sticky bits are NOT
+    carried over (masked with 0o7777).
     """
+    if path.is_symlink():
+        path = path.resolve()
     import secrets
     for _ in range(10):
         tmp = path.with_name(f".{path.name}.exifwipe_tmp_{secrets.token_hex(8)}")
@@ -1311,26 +1764,49 @@ def _atomic_write_bytes(path: Path, cleaned: bytes, st) -> None:
             except OSError:
                 pass
             raise
-        os.chmod(tmp, st.st_mode)
+        # preserve the permission bits only — setuid/setgid/sticky are
+        # dropped (carrying them over would be sloppy and exploitable)
+        os.chmod(tmp, stat.S_IMODE(st.st_mode) & 0o777)
         os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
         os.replace(tmp, path)
         return
     raise OSError(f"could not reserve a unique temp name for {path.name}")
 
 
-def write_output(src: Path, out: Optional[Path], cleaned: bytes) -> None:
+def write_output(src: Path, out: Optional[Path], cleaned: bytes,
+                 no_clobber: bool = False) -> None:
     """Either overwrite src in place, or write to `out` (file or dir)."""
     if out is None:
-        st = src.stat()
-        _atomic_write_bytes(src, cleaned, st)
+        _refuse_system_target(src)
+        target = src
+        if src.is_symlink():
+            resolved = src.resolve()
+            if not resolved.is_file():
+                raise OSError(f"{src} is a dangling symlink — nothing to strip")
+            target = resolved
+            print(f"  {c_warn('[LINK]')} {c_head(str(src))} -> "
+                  f"{c_head(str(target))} {c_dim('(stripping target in place)')}")
+        st = target.stat()
+        if st.st_nlink > 1:
+            print(f"  {c_warn('[WARN]')} {c_head(str(target))} has "
+                  f"{st.st_nlink} hard links — the other names still point "
+                  "at the pre-wipe data", file=sys.stderr)
+        _atomic_write_bytes(target, cleaned, st)
         print(f"  {c_ok('[STRIPPED]')} {c_head(str(src))}")
     else:
         # if user passed a folder or a path-without-suffix, drop src inside
         if out.is_dir() or (not out.suffix and not out.exists()):
             out = out / src.name
+        _refuse_system_target(out)
+        if no_clobber and out.exists():
+            raise FileExistsError(f"{out} already exists (--no-clobber)")
+        if out.exists() and out.resolve() != src.resolve():
+            print(f"  {c_warn('[clobber]')} overwriting existing "
+                  f"{c_head(str(out))}", file=sys.stderr)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(cleaned)
-        print(f"  {c_ok('[STRIPPED]')} {c_head(str(src))}  {c_dim('->')}  {c_head(str(out))}")
+        print(f"  {c_ok('[STRIPPED]')} {c_head(str(src))}  {c_dim('->')}  "
+              f"{c_head(str(out))}")
 
 
 def _sniff_format(path: Path) -> Optional[str]:
@@ -1394,6 +1870,8 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
             print(f"  {c_dim('[skip] unrecognized:')} {path.name}")
         return R_SKIP
 
+    no_clobber = bool(getattr(args, "no_clobber", False))
+
     if fmt in RAW_FORMATS:
         # RAW: NEVER pixel-rebuild (the sensor data can't be re-encoded) —
         # lossless in-place IFD surgery only, loud refusal on failure
@@ -1414,29 +1892,34 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
                 raise RuntimeError(
                     "not a parseable TIFF container — refusing to rebuild "
                     "RAW sensor data (BigTIFF/encrypted/corrupt?)")
-            write_output(path, args.output, cleaned)
+            write_output(path, args.output, cleaned, no_clobber=no_clobber)
         except Exception as e:
             print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
             return R_ERR
         return R_OK
 
-    if fmt in ("jpeg", "png", "gif", "tiff", "webp", "bmp", "heif", "avif"):
+    if fmt in IMAGE_FORMATS:
         if args.dry_run or args.inspect:
             try:
-                inspect_image(path)
+                inspect_image(path, max_pixels=getattr(args, "max_pixels", None))
             except Exception as e:
                 print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
                 return R_ERR
             return R_OK
         try:
-            cleaned, fmt_out = strip_image_bytes(path, keep_icc=args.keep_icc)
-            write_output(path, args.output, cleaned)
+            cleaned, fmt_out = strip_image_bytes(
+                path, keep_icc=args.keep_icc,
+                max_pixels=getattr(args, "max_pixels", None))
+            write_output(path, args.output, cleaned, no_clobber=no_clobber)
         except Exception as e:
             print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
             return R_ERR
         if args.verbose:
             try:
-                inspect_image(path if args.output is None else args.output / path.name)
+                check = args.output if args.output is not None else path
+                if check.is_dir() or (not check.suffix and not check.exists()):
+                    check = check / path.name
+                inspect_image(check, max_pixels=getattr(args, "max_pixels", None))
             except Exception as e:
                 print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
         return R_OK
@@ -1449,7 +1932,7 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
         if not cleaned:
             return R_ERR
         try:
-            write_output(path, args.output, cleaned)
+            write_output(path, args.output, cleaned, no_clobber=no_clobber)
         except Exception as e:
             print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
             return R_ERR
@@ -1609,11 +2092,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="after stripping, prove no metadata remains "
                         "(exiftool if installed, else per-format parsers); "
                         "exit nonzero if anything leaks")
+    p.add_argument("--max-pixels", type=int, default=None,
+                   help=f"refuse images larger than N pixels "
+                        f"(default {DEFAULT_MAX_PIXELS:,}; 0 = unlimited)")
+    p.add_argument("--no-clobber", action="store_true",
+                   help="refuse to overwrite an existing -o target")
     p.add_argument("--formats", action="store_true",
                    help="print what formats are guaranteed clean "
                       "vs best-effort, then exit")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="also print inspection after stripping")
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {__version__}")
     color_group = p.add_mutually_exclusive_group()
     color_group.add_argument("--color", dest="color", action="store_const",
                              const=True, default=None,
@@ -1649,9 +2139,8 @@ def main(argv: Optional[list] = None) -> int:
         for p in targets:
             try:
                 fmt = _sniff_format(p) if p.is_file() else None
-                if fmt in ("jpeg", "png", "gif", "tiff", "webp", "bmp",
-                           "heif", "avif"):
-                    inspect_image(p)
+                if fmt in IMAGE_FORMATS:
+                    inspect_image(p, max_pixels=args.max_pixels)
                 elif fmt in RAW_FORMATS:
                     st = p.stat()
                     print(f"\n=== {p.name} ===")
@@ -1680,10 +2169,29 @@ def main(argv: Optional[list] = None) -> int:
         )
         return 2
 
+    # -o pointing at a (new) dir: resolve per-file outputs and make sure
+    # duplicate basenames don't silently clobber each other.
+    out_dir = None
+    if args.output is not None and (args.output.is_dir()
+                                    or (not args.output.suffix and not args.output.exists())):
+        out_dir = args.output
+
     n_ok = n_err = n_skip = 0
     leaks = []
+    used_out = {}
     for p in targets:
-        res = handle_one(p, args)
+        per = args
+        if out_dir is not None:
+            stem, suff = p.stem, p.suffix
+            cand, i = p.name, 2
+            while cand in used_out:
+                cand = f"{stem} ({i}){suff}"
+                i += 1
+            used_out[cand] = True
+            per = argparse.Namespace(**vars(args))
+            per.output = out_dir / cand
+
+        res = handle_one(p, per)
         if res == R_OK:
             n_ok += 1
         elif res == R_ERR:
@@ -1692,8 +2200,11 @@ def main(argv: Optional[list] = None) -> int:
         else:
             n_skip += 1
             continue
-        if args.verify:
-            check = p if args.output is None else args.output / p.name
+
+        # verify only files that were actually written (dry-run leaves the
+        # original untouched, so verifying it would be a guaranteed FAIL)
+        if args.verify and not args.dry_run:
+            check = per.output if per.output is not None else p
             try:
                 clean, found = verify_clean(check)
             except Exception as e:
