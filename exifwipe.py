@@ -837,8 +837,23 @@ def main(argv: Optional[list] = None) -> int:
         print(f"  [ERR] not found: {args.input}", file=sys.stderr)
         return 2
 
+    targets = list(iter_inputs(args.input))
+
+    # guard: batch input to a single-file `-o` silently overwrites itself.
+    # If --output looks like a FILE (has a suffix, isn't a dir) but we're
+    # about to process more than one source, refuse loudly instead.
+    output_is_file = (args.output is not None and args.output.suffix
+                      and not args.output.is_dir())
+    if output_is_file and len(targets) > 1:
+        print(
+            f"  {c_err('[ERR]')} -o looks like a single file but "
+            f"{len(targets)} inputs are queued. Point -o at a directory instead.",
+            file=sys.stderr,
+        )
+        return 2
+
     n_ok, n_err = 0, 0
-    for p in iter_inputs(args.input):
+    for p in targets:
         if handle_one(p, args):
             n_ok += 1
         else:
