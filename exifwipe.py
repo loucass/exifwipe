@@ -626,10 +626,10 @@ def handle_one(path: Path, args: argparse.Namespace) -> bool:
             return True
         try:
             cleaned, fmt_out = strip_image_bytes(path, keep_icc=args.keep_icc)
+            write_output(path, args.output, cleaned)
         except Exception as e:
             print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
             return False
-        write_output(path, args.output, cleaned)
         if args.verbose:
             inspect_image(path if args.output is None else args.output / path.name)
         return True
@@ -641,7 +641,11 @@ def handle_one(path: Path, args: argparse.Namespace) -> bool:
         cleaned = strip_pdf_bytes(path)
         if not cleaned:
             return False
-        write_output(path, args.output, cleaned)
+        try:
+            write_output(path, args.output, cleaned)
+        except Exception as e:
+            print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
+            return False
         return True
 
     if args.verbose:
