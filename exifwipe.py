@@ -264,7 +264,7 @@ __license__ = "MIT"
 # --------------------------------------------------------------------------- #
 # config
 # --------------------------------------------------------------------------- #
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff",
+IMAGE_EXTS = {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".tif", ".tiff",
               ".bmp", ".gif", ".heic", ".heif", ".avif"}
 DOC_EXTS = {".pdf"}  # pikepdf dep — see strip_pdf_metadata()
 
@@ -685,17 +685,59 @@ def write_output(src: Path, out: Optional[Path], cleaned: bytes) -> None:
         print(f"  {c_ok('[STRIPPED]')} {c_head(str(src))}  {c_dim('->')}  {c_head(str(out))}")
 
 
+def _sniff_format(path: Path) -> Optional[str]:
+    """Detect a file's real format from its magic bytes, not its name.
+    Returns a normalized format name ('jpeg', 'png', 'gif', 'tiff',
+    'webp', 'bmp', 'heif', 'avif', 'pdf') or None if unrecognized."""
+    try:
+        head = path.open("rb").read(16)
+    except OSError:
+        return None
+    if head[:2] == b"\xff\xd8":
+        return "jpeg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    if head[:4] in (b"II*\x00", b"MM\x00*"):
+        return "tiff"
+    if head[:2] == b"BM":
+        return "bmp"
+    if head[:4] == b"%PDF":
+        return "pdf"
+    if head[4:8] == b"ftyp":
+        brand = head[8:12]
+        # HEIF/AVIF share the ISO BMFF container; disambiguate by brand
+        if brand in (b"avif", b"avis"):
+            return "avif"
+        if brand in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1",
+                     b"heif", b"heim"):
+            return "heif"
+    return None
+
+
 def handle_one(path: Path, args: argparse.Namespace) -> bool:
-    """Returns True if file was processed.
+    """Return True if the file was processed successfully, False on error.
 
     The flow per file:
-      - dry-run       -> inspect_image() and return.
-      - inspect-only  -> inspect_image() and return.
+      - dry-run       -> inspect what would happen and return.
+      - inspect-only  -> inspect and return.
       - otherwise     -> strip and write.
-    """
-    sfx = path.suffix.lower()
 
-    if sfx in IMAGE_EXTS:
+    Dispatch is by magic bytes (sniffed), not by file extension, so a
+    downloaded JPEG with no extension is still stripped. The extension
+    only degrades to deciding the output filename."""
+
+    fmt = _sniff_format(path) if path.is_file() else None
+    if fmt is None:
+        # not a real image/pdf we recognize — skip silently on dry-ness
+        if args.verbose:
+            print(f"  {c_dim('[skip] unrecognized:')} {path.name}")
+        return False
+
+    if fmt in ("jpeg", "png", "gif", "tiff", "webp", "bmp", "heif", "avif"):
         if args.dry_run or args.inspect:
             try:
                 inspect_image(path)
@@ -716,7 +758,7 @@ def handle_one(path: Path, args: argparse.Namespace) -> bool:
                 print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
         return True
 
-    if sfx in DOC_EXTS:
+    if fmt == "pdf":
         if args.dry_run or args.inspect:
             print(f"  {c_dim('(would strip PDF metadata)')} {path.name}")
             return True
@@ -731,7 +773,7 @@ def handle_one(path: Path, args: argparse.Namespace) -> bool:
         return True
 
     if args.verbose:
-        print(f"  {c_dim('[skip] unsupported suffix:')} {path.name}")
+        print(f"  {c_dim('[skip] unsupported:')} {path.name}")
     return False
 
 
@@ -898,9 +940,11 @@ def main(argv: Optional[list] = None) -> int:
         n_err = 0
         for p in targets:
             try:
-                if p.suffix.lower() in IMAGE_EXTS:
+                fmt = _sniff_format(p) if p.is_file() else None
+                if fmt in ("jpeg", "png", "gif", "tiff", "webp", "bmp",
+                           "heif", "avif"):
                     inspect_image(p)
-                elif p.suffix.lower() in DOC_EXTS:
+                elif fmt == "pdf":
                     print(f"\n=== {p.name} ===")
                     print("  (PDF — use pikepdf or `exiftool -all=` to inspect)")
             except Exception as e:
