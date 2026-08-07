@@ -21,13 +21,19 @@ classifiers = [
 dependencies = [
     "Pillow>=8.0",
 ]
-# runtime-optional (degrade gracefully, loader prints install hint):
-#   piexif       -> JPEG round-trip verify
-#   pillow-heif  -> HEIC / AVIF input
-#   pikepdf      -> PDF DocInfo + XMP strip
+
+[project.optional-dependencies]
+verify = ["piexif>=1.1.3"]      # JPEG round-trip verify after save
+heif = ["pillow-heif"]         # HEIC / AVIF input
+pdf = ["pikepdf"]              # PDF /DocInfo + XMP strip
+dev = ["pytest>=7.0", "piexif>=1.1.3"]
 
 [project.scripts]
 exifwipe = "exifwipe:main"
 
 [tool.setuptools]
 py-modules = ["exifwipe"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
