@@ -532,6 +532,50 @@ def mpo_rotated_first(path):
     return Path(path)
 
 
+def raf_fixture(path, with_preview=True, with_fuji_ifd=True,
+                model=b"FinePix S3Pro", serial=b"FA392001"):
+    """Synthetic Fuji RAF matching exiftool's layout (FujiFilm.pm): a
+    0x94-byte header carrying serial/model, an optional embedded JPEG
+    preview with EXIF, and an optional FujiIFD TIFF block with an EXIF
+    pointer + MakerNote. The header is padded to 0x100 so the declared
+    preview offset matches where the preview bytes actually land."""
+    hdr = bytearray(0x100)
+    hdr[0x00:0x10] = b"FUJIFILMCCD-RAW "
+    hdr[0x10:0x14] = b"0201"
+    hdr[0x14:0x14 + len(serial)] = serial
+    hdr[0x1c:0x1c + len(model)] = model
+    hdr[0x3c:0x40] = b"0101"
+    body = bytearray()
+    jpos = jlen = 0
+    if with_preview:
+        img = Image.new("RGB", (24, 16), (90, 140, 200))
+        exif = piexif.dump({"0th": {0x010F: b"FUJICAM", 0x0131: b"FUJI-SW"},
+                            "Exif": {0x9003: b"2024:05:06 07:08:09"}})
+        b = io.BytesIO()
+        img.save(b, format="JPEG", exif=exif)
+        jpeg = b.getvalue()
+        jpos, jlen = 0x100, len(jpeg)
+        body += jpeg
+    foff = flen = 0
+    if with_fuji_ifd:
+        tiff = build_tiff(
+            [(0x010F, 2, "FujiCamX"), (0x8769, 4, ("ref", "exif"))],
+            exif=[(0x9003, 2, "2023:01:01 00:00:00"),
+                  (0x927C, 7, b"FUJIFILM-MAKERNOTE")],
+            pixels=b"\x00\x00\x00" * 16,
+        )
+        foff, flen = 0x100 + jlen, len(tiff)
+        body += tiff
+    hdr[0x54:0x58] = jpos.to_bytes(4, "big")
+    hdr[0x58:0x5c] = jlen.to_bytes(4, "big")
+    hdr[0x5c:0x60] = (0x100 + jlen + flen).to_bytes(4, "big")  # RAF dir (empty)
+    hdr[0x60:0x64] = (0).to_bytes(4, "big")
+    hdr[0x64:0x68] = foff.to_bytes(4, "big")
+    hdr[0x68:0x6c] = flen.to_bytes(4, "big")
+    Path(path).write_bytes(bytes(hdr) + bytes(body))
+    return Path(path)
+
+
 def heic_fixture(path, exif=True, xmp=True, avif=False):
     """HEIC/AVIF with EXIF + XMP items via pillow-heif. Returns None when
     pillow-heif (or its libheif) isn't available so tests can skip."""

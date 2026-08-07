@@ -131,6 +131,35 @@ def test_bigtiff_dng_surgery(tmp_path):
     assert cleaned[-64 * 3:] == data[-64 * 3:]
 
 
+def test_raf_truncated_refused(tmp_path, capsys):
+    # a truncated RAF (magic + < 0x94 header bytes) must ERROR loudly,
+    # never skip silently and never claim a clean wipe it can't verify
+    src = tmp_path / "fuji.raf"
+    src.write_bytes(b"FUJIFILMCCD-RAW " + b"\x00" * 64)
+    assert exifwipe._sniff_format(src) == "raf"
+    args = exifwipe.build_parser().parse_args([str(src)])
+    assert exifwipe.handle_one(src, args) == exifwipe.R_ERR
+    assert "RAF" in capsys.readouterr().err
+
+
+def test_raf_minimal_header_strips(tmp_path):
+    # valid-length RAF with no preview / no FujiIFD: the header identity
+    # zone (serial + model) gets blanked, the file stays a valid RAF
+    src = tmp_path / "mini.raf"
+    hdr = bytearray(0x94)
+    hdr[:16] = b"FUJIFILMCCD-RAW "
+    hdr[0x10:0x14] = b"0201"
+    hdr[0x14:0x1c] = b"SERIAL01"
+    hdr[0x1c:0x1c + 10] = b"FinePix X1"
+    src.write_bytes(bytes(hdr))
+    args = exifwipe.build_parser().parse_args([str(src)])
+    assert exifwipe.handle_one(src, args) == exifwipe.R_OK
+    out = src.read_bytes()
+    assert out[:16] == b"FUJIFILMCCD-RAW "
+    assert b"SERIAL01" not in out
+    assert b"FinePix X1" not in out
+
+
 def test_corrupt_raw_refused_not_rebuilt(tmp_path):
     # cut into the IFD structure (not just the pixel tail): surgery must
     # refuse loudly, never "strip" a file it can't fully verify — and

@@ -293,6 +293,8 @@ DEFAULT_MAX_PIXELS = 178_000_000
 _SYSTEM_DIRS = {"etc", "usr", "bin", "sbin", "lib", "lib64", "boot",
                 "proc", "sys", "dev", "run"}
 
+_RAF_MAGIC = b"FUJIFILMCCD-RAW "
+
 
 # --------------------------------------------------------------------------- #
 # inspection — print what exiftool would surface
@@ -835,6 +837,23 @@ def _verify_bytes(path: Path, fmt: str) -> list:
             leaks.append("XMP")
     elif fmt in ("tiff",) + tuple(RAW_FORMATS):
         leaks = _tiff_find_identifying(data)
+    elif fmt == "raf":
+        # header identity zone (serial + model + firmware) must be blank
+        zone = data[0x14:0x40] if len(data) >= 0x40 else b""
+        if any(b not in (0, 32) for b in zone):
+            leaks.append("header-serial/model")
+        jpos = int.from_bytes(data[0x54:0x58], "big") if len(data) >= 0x5c else 0
+        jlen = int.from_bytes(data[0x58:0x5c], "big") if len(data) >= 0x5c else 0
+        if jpos and jlen and jpos + jlen <= len(data):
+            for nm in _jpeg_metadata_segments(data[jpos:jpos + jlen]):
+                leaks.append(f"preview:{nm}")
+        foff = int.from_bytes(data[0x64:0x68], "big") if len(data) >= 0x6c else 0
+        flen = int.from_bytes(data[0x68:0x6c], "big") if len(data) >= 0x6c else 0
+        if foff and flen and foff + flen <= len(data):
+            region = data[foff:foff + flen]
+            if region[:2] in (b"II", b"MM") and _tiff_parse_header(region):
+                for nm in _tiff_find_identifying(region):
+                    leaks.append(f"fujiifd:{nm}")
     elif fmt in ("heif", "avif"):
         # ISO BMFF: check the iloc-mapped EXIF/XMP extents, not the box
         # type strings ("Exif"/"mime" survive the wipe as structure).
@@ -903,12 +922,16 @@ def print_formats_matrix() -> None:
         ("dng/cr2/nef/arw/orf/rw2/pef/srw",
                       "lossless in-place IFD surgery",
                       "clean; sensor data byte-identical, never rebuilt"),
-        ("bmp",       "pixel rebuild",
-                      "clean"),
         ("heif/avif", "lossless ISO-BMFF surgery: EXIF/XMP item extents "
                       "zeroed",
                       "clean; pixels byte-identical; re-encode fallback "
                       "only if container unparseable"),
+        ("raf",       "lossless: header strings + embedded-JPEG EXIF + "
+                      "FujiIFD",
+                      "clean for those carriers; refuses on unparseable "
+                      "preview/IFD"),
+        ("bmp",       "pixel rebuild",
+                      "clean"),
         ("pdf",       "pikepdf: /Info + /Metadata + /Lang/JS/PageLabels",
                       "BEST-EFFORT: embedded-image EXIF may survive"),
     ]
@@ -2021,6 +2044,81 @@ def _strip_heif_lossless(data: bytes):
 
 
 # --------------------------------------------------------------------------- #
+# Fuji RAF — lossless (header strings + embedded JPEG EXIF + FujiIFD)
+# --------------------------------------------------------------------------- #
+# Layout (exiftool FujiFilm.pm, authoritative):
+#   0x00  "FUJIFILMCCD-RAW " magic (16)
+#   0x10  version string (4 ascii, kept — parsers need it)
+#   0x14  serial number (8 ascii)  <- identity, blanked
+#   0x1c  camera model string (NUL-terminated)  <- identity, blanked
+#   0x3c  firmware version (4)     <- blanked
+#   0x54  embedded JPEG preview offset (u32 BE)
+#   0x58  embedded JPEG preview length (u32 BE)
+#   0x5c/0x60  RAF directory offset/length (geometry tags)
+#   0x64/0x68  FujiIFD TIFF-block offset/length
+#   0x78/0x7c  RAF1 dir, 0x80/0x84 FujiIFD1
+# The EXIF with camera identity lives in the embedded JPEG preview; some
+# models also carry a FujiIFD TIFF block that can hold EXIF pointers.
+def _strip_raf_lossless(data: bytes, keep_icc: bool = False):
+    """Lossless wipe of a Fuji RAF container: blank the serial + camera
+    model + firmware in the header, lossless-strip the embedded JPEG
+    preview's EXIF (write back padded, update the length field), and run
+    TIFF surgery on the FujiIFD block when it's a parseable TIFF. Returns
+    None when the container can't be verified clean (caller refuses)."""
+    if data[:16] != _RAF_MAGIC or len(data) < 0x94:
+        return None
+    out = bytearray(data)
+    # header identity: serial + model + firmware (version digits kept)
+    out[0x14:0x40] = b"\x00" * (0x40 - 0x14)
+    jpos = int.from_bytes(data[0x54:0x58], "big")
+    jlen = int.from_bytes(data[0x58:0x5c], "big")
+    foff = int.from_bytes(data[0x64:0x68], "big")
+    flen = int.from_bytes(data[0x68:0x6c], "big")
+    # embedded JPEG preview — this is where camera EXIF lives
+    if jpos and jlen and jpos + jlen <= len(data):
+        jpeg = bytes(data[jpos:jpos + jlen])
+        if jpeg[:2] != b"\xff\xd8":
+            return None         # preview exists but isn't a JPEG — refuse
+        stripped = _strip_jpeg_lossless(jpeg, keep_icc)
+        if stripped is None:
+            return None
+        if stripped != jpeg:
+            if len(stripped) > jlen:
+                return None     # can't grow in place — refuse
+            out[jpos:jpos + len(stripped)] = stripped
+            if len(stripped) < jlen:
+                out[jpos + len(stripped):jpos + jlen] = b"\x00" * (jlen - len(stripped))
+            out[0x58:0x5c] = len(stripped).to_bytes(4, "big")
+    # FujiIFD TIFF block (only some models; self-contained TIFF whose
+    # internal offsets are relative to the block start)
+    if foff and flen and foff + flen <= len(data):
+        region = bytes(out[foff:foff + flen])
+        if region[:2] in (b"II", b"MM") and _tiff_parse_header(region):
+            surg = _tiff_strip_lossless(region, keep_icc)
+            if surg is None:
+                return None     # TIFF-looking block we can't verify — refuse
+            out[foff:foff + flen] = surg
+    cleaned = bytes(out)
+    # self-verify before handing it out — a wipe that still leaks is not
+    # a wipe
+    jpos2 = int.from_bytes(cleaned[0x54:0x58], "big")
+    jlen2 = int.from_bytes(cleaned[0x58:0x5c], "big")
+    if jpos2 and jlen2 and jpos2 + jlen2 <= len(cleaned):
+        if _jpeg_metadata_segments(bytes(cleaned[jpos2:jpos2 + jlen2]), keep_icc):
+            raise RuntimeError("RAF embedded JPEG still carries metadata "
+                               "— refusing to write a dirty file")
+    foff2 = int.from_bytes(cleaned[0x64:0x68], "big")
+    flen2 = int.from_bytes(cleaned[0x68:0x6c], "big")
+    if foff2 and flen2 and foff2 + flen2 <= len(cleaned):
+        reg2 = bytes(cleaned[foff2:foff2 + flen2])
+        if reg2[:2] in (b"II", b"MM") and _tiff_parse_header(reg2):
+            if _tiff_find_identifying(reg2):
+                raise RuntimeError("RAF FujiIFD still carries identifying "
+                                   "metadata — refusing to write a dirty file")
+    return cleaned
+
+
+# --------------------------------------------------------------------------- #
 # PDF — best-effort strip via pikepdf if available
 # --------------------------------------------------------------------------- #
 def strip_pdf_bytes(path: Path) -> bytes:
@@ -2186,6 +2284,8 @@ def _sniff_bytes(data: bytes) -> Optional[str]:
         return "gif"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "webp"
+    if data[:16] == _RAF_MAGIC:
+        return "raf"          # Fuji — NOT a TIFF container
     if data[:4] in (b"II*\x00", b"MM\x00*"):
         # CR2: 16-byte header (IFD0 at 0x10) + CR2 magic 0x0201 at offset 8
         if (data[:8] == b"II*\x00\x10\x00\x00\x00"
@@ -2223,6 +2323,8 @@ def _sniff_format(path: Path) -> Optional[str]:
         return "gif"
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return "webp"
+    if head[:16] == _RAF_MAGIC:
+        return "raf"          # Fuji — NOT a TIFF container
     if head[:4] in (b"II*\x00", b"MM\x00*"):
         # TIFF-family RAW containers are structurally TIFF; the extension
         # (or a deep read below) tells them apart from a plain TIFF
@@ -2269,6 +2371,35 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
         return R_SKIP
 
     no_clobber = bool(getattr(args, "no_clobber", False))
+
+    if fmt == "raf":
+        # Fuji RAF is NOT a TIFF container, but it is writable losslessly:
+        # header strings + embedded JPEG preview EXIF + FujiIFD block.
+        # Never rebuilt from pixels; loud refusal when it can't be verified.
+        if args.dry_run or args.inspect:
+            try:
+                st = path.stat()
+                print(f"  {c_info('RAF')} {c_head(path.name)}: {st.st_size:,} "
+                      "bytes — surgery would blank header model/serial, "
+                      "strip the embedded JPEG preview's EXIF and clean "
+                      "the FujiIFD block")
+            except OSError as e:
+                print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}",
+                      file=sys.stderr)
+                return R_ERR
+            return R_OK
+        try:
+            cleaned = _strip_raf_lossless(path.read_bytes(),
+                                          keep_icc=args.keep_icc)
+            if cleaned is None:
+                raise RuntimeError(
+                    "not a parseable RAF container (truncated header or "
+                    "unparseable embedded preview) — refusing to guess")
+            write_output(path, args.output, cleaned, no_clobber=no_clobber)
+        except Exception as e:
+            print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
+            return R_ERR
+        return R_OK
 
     if fmt in RAW_FORMATS:
         # RAW: NEVER pixel-rebuild (the sensor data can't be re-encoded) —
@@ -2572,6 +2703,12 @@ def main(argv: Optional[list] = None) -> int:
                     print(f"  RAW {fmt.upper()}: {st.st_size:,} bytes, "
                           "TIFF-family container — `exiftool -a -G1 FILE` "
                           "sees what surgery would remove")
+                elif fmt == "raf":
+                    st = p.stat()
+                    print(f"\n=== {p.name} ===")
+                    print(f"  Fuji RAF: {st.st_size:,} bytes — header "
+                          "model/serial + embedded JPEG EXIF + FujiIFD "
+                          "block (surgery would remove all of it)")
                 elif fmt == "pdf":
                     print(f"\n=== {p.name} ===")
                     print("  (PDF — use pikepdf or `exiftool -all=` to inspect)")
