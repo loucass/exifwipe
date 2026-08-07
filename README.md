@@ -10,6 +10,8 @@ The philosophy is simple and it's the opposite of the other tools: **when the fo
 
 ```bash
 pip install exifwipe            # or: pipx install .
+pip install exifwipe[verify]    # + piexif  (JPEG round-trip verify)
+pip install exifwipe[heif,pdf]  # + pillow-heif, pikepdf (HEIC/AVIF/PDF)
 ```
 
 System Pillow is usually better on Linux (it's the one with the C codecs):
@@ -31,11 +33,14 @@ exifwipe photo.jpg --inspect        # show what exiftool would surface
 exifwipe photo.jpg --dry-run -v     # preview, write nothing (and mean it)
 exifwipe photo.jpg --verify         # prove nothing leaked (exit 3 if it did)
 exifwipe photo.jpg --no-clobber     # refuse to overwrite an existing -o target
+exifwipe photo.jpg --report         # print exactly which fields were removed
+exifwipe IMG_0001.DNG --drop-orientation   # RAW: also blank the Orientation tag
+exifwipe photo.jpg --perturb 2      # +-2 pixel noise: breaks naive reverse-search
 exifwipe --formats                  # mechanism | guarantee per format
-exifwipe                            # interactive menu
+exifwipe                            # interactive menu (clears screen between ops)
 ```
 
-Detection is by **magic bytes**, not extension — a downloaded JPEG with no name is stripped like `photo.jpg`, and an extensionless CR2 is still caught by its header. DNG is caught by its DNGVersion tag even without an extension.
+Detection is by **magic bytes**, not extension — a downloaded JPEG with no name is stripped like `photo.jpg`, and an extensionless CR2 is still caught by its header. NEF/ARW/ORF/RW2/PEF are structurally plain TIFFs, but they're now told apart from a generic TIFF by their **vendor MakerNote prefixes** — so extensionless NEFs and ARWs work too. `--report` prints exactly which tags/chunks died per file, so you don't have to take anyone's word for it.
 
 ### Exit codes
 
@@ -59,8 +64,9 @@ Detection is by **magic bytes**, not extension — a downloaded JPEG with no nam
 | TIFF | lossless in-place IFD surgery | clean, pixels + pages byte-identical |
 | DNG / CR2 / NEF / ARW / ORF / RW2 / PEF / SRW | lossless in-place IFD surgery | clean, **sensor data byte-identical, never rebuilt** |
 | BMP | pixel rebuild | clean |
-| HEIC / AVIF | re-encode via pillow-heif (optional dep) | clean single-frame only |
+| HEIC / AVIF | lossless ISO-BMFF surgery: EXIF/XMP item extents zeroed via iloc | clean, pixels **byte-identical**; clean re-encode fallback only if the container can't be parsed |
 | PDF | pikepdf: /Info + /Metadata + /Lang + JS + PageLabels + PieceInfo + StructTreeRoot | **best-effort**: embedded-image EXIF may survive |
+| RAF (Fuji) | lossless: header strings + embedded-JPEG EXIF + FujiIFD block surgery | clean for every carrier; refuses on unparseable preview/IFD |
 
 Structural things are kept on purpose (JFIF header, dimensions, ICC only when you ask) — viewers refuse to open files without them, and they're not identifying.
 
@@ -72,16 +78,16 @@ RAW sensor data cannot be re-encoded — it's not pixels, it's a sensor dump wit
 2. Identifying scalar tags (Make, Model, Software, Artist, Copyright, ImageDescription, SerialNumber, UniqueCameraModel, LocalizedCameraModel, DNGPrivateData, OriginalRawFile\*) are blanked in place.
 3. **No offset is ever remapped.** Pixel data — and the 40MB of compressed sensor data in a CR2 — stays byte-identical. We verify that in the test suite, byte for byte.
 
-Supported: classic TIFF *and* BigTIFF (the DNG spec explicitly allows BigTIFF; so do we). Detection: DNG by extension or by its DNGVersion tag (0xC612) — extensionless DNGs work; CR2 by its 0x0201 magic — extensionless CR2s work; the rest of the RAW family by their extensions.
+Supported: classic TIFF *and* BigTIFF (the DNG spec explicitly allows BigTIFF; so do we). Detection: DNG by extension or by its DNGVersion tag (0xC612) — extensionless DNGs work; CR2 by its 0x0201 magic — extensionless CR2s work; NEF/ARW/ORF/RW2/PEF by their vendor MakerNote prefixes — extensionless files work. Fuji **RAF** is no longer a refusal: it gets its own lossless surgery — header strings (version, unique ID), the embedded JPEG preview's EXIF, and the FujiIFD TIFF block (which can itself hold EXIF/GPS pointers) are all stripped in place, no re-encode. By default RAW files keep their **Orientation** tag (it's a display instruction — you can't re-rotate sensor pixels without a lossy demosaic) — `--drop-orientation` blanks it if you want it gone.
 
-And if a RAW file's IFD structure is truncated or hostile, the surgery **refuses** — it will not "clean" a file it can't fully verify, and it will never fall back to rebuilding sensor data it can't decode.
+And if a RAW file's IFD structure is truncated or hostile, the surgery **refuses** — it will not "clean" a file it can't fully verify, and it will never fall back to rebuilding sensor data it can't decode. The fuzz suite byte-flips and truncates real CR2/DNG/BigTIFF corpora to make sure it refuses instead of corrupting.
 
 ## How it works
 
 Three layers, because "just one" quietly fails sometimes:
 
-1. **Lossless marker rewrite (JPEG).** Every APPn/COM segment is dropped from the marker stream; entropy-coded pixels are copied **verbatim**. Multi-frame streams (MPO) are split per SOI..EOI pair so no frame is lost, trailing garbage after the final EOI is dropped, and a rotated first frame is re-encoded while the rest stays lossless. If the whole photo needs rotation, the rotation is baked into the pixels and the frame is rebuilt.
-2. **Lossless surgery (TIFF family)** — see above. No decode, no re-encode, no offset remap.
+1. **Lossless marker rewrite (JPEG).** Every APPn/COM segment is dropped from the marker stream; entropy-coded pixels are copied **verbatim**. Orientation and dimensions are read from the marker stream (SOF/APP0) — the pixels are **not decoded** when a lossless strip is possible, so a 50MP photo strips in milliseconds. Multi-frame streams (MPO) are split per SOI..EOI pair so no frame is lost, trailing garbage after the final EOI is dropped, and a rotated first frame is re-encoded while the rest stays lossless. If the whole photo needs rotation, the rotation is baked into the pixels and the frame is rebuilt.
+2. **Lossless surgery (TIFF family + HEIC/AVIF + RAF)** — see above. TIFF-family IFD surgery at 700+ MB/s; HEIC/AVIF EXIF/XMP item extents zeroed through the iloc table with pixels byte-identical; RAF header strings + preview EXIF + FujiIFD scrubbed. No decode, no re-encode.
 3. **Fresh-frame rebuild (everything else).** Pixels copied one bounded 256px tile at a time (a 100MP photo never materializes a giant Python list), saved with `exif=b""`, `xmp=b""`, empty `pnginfo`. Animated GIF/APNG/WebP and multipage TIFF keep every frame; lossless WebP in stays lossless WebP out — we don't silently downgrade your byte-exact file to q90 lossy.
 4. **Verification.** `--verify` re-opens the output and confirms nothing survived — exiftool when it's installed, otherwise per-format byte parsers. The JPEG verifier checks **every frame** (an MPO whose EXIF only lives in frame 2 used to sail through as "clean"). The PNG verifier scans the **whole file**, including chunks tucked after IEND. A file that still leaks exits 3.
 
@@ -102,7 +108,7 @@ Read it right: the lossless paths (JPEG markers, GIF bytes, TIFF surgery) cost a
 
 ## The black-hoodie test suite
 
-The suite is **88 tests** and it's not there to make the tool look good — it's there to make it **fail**. Every attack I could think of across the rounds is a test now:
+The suite is **131 tests** and it's not there to make the tool look good — it's there to make it **fail**. Every attack I could think of across all three rounds is a test now:
 
 - MPO with a rotated first frame (used to silently delete frame 2) → both frames must survive, rotation baked in
 - APNG (used to collapse to one frame) → animation + pixels byte-identical
@@ -117,19 +123,27 @@ The suite is **88 tests** and it's not there to make the tool look good — it's
 - a 10-frame animation over the cumulative pixel budget → refused
 - hostile TIFF IFD graphs (cycles, fake entry counts) → terminate, never hang
 - mutation-fuzzed JPEG/GIF entropy streams → terminate, never hang
-- the whole RAW family: CR2/DNG/BigTIFF fixtures handcrafted byte-by-byte, sensor data asserted byte-identical after the wipe
+- **mutation-fuzzed TIFF surgery**: byte flips + truncations across a CR2/DNG/TIFF corpus → the surgery must refuse, never corrupt, and any file it *does* clean must come out structurally valid with pixels intact
+- a hostile TIFF tag value offset pointing at the IFD **or at pixel strips** → refused (structural bytes AND StripOffsets/StripByteCounts ranges are protected from blanking)
+- HEIC: EXIF+XMP extents zeroed through iloc, pixels byte-identical, and the verifier re-reads it
+- RAF: header strings + preview EXIF + FujiIFD all wiped, fixture asserted byte-identical on sensor bytes
+- `--report` names exactly the removed fields; `--perturb` changes pixels but keeps the image decodable; `--drop-orientation` blanks RAW orientation
+- JPEG fast path: `--dry-run`/lossless strip on an 8MP JPEG does **no** pixel decode (asserted via instrumented Image.open)
+- and the whole RAW family: CR2/DNG/BigTIFF fixtures handcrafted byte-by-byte, sensor data asserted byte-identical after the wipe
 
 ```bash
 pip install pytest
-python -m pytest            # 88 tests. They pass because they had to.
+python -m pytest            # 131 tests. They pass because they had to.
 ```
 
 ## Known limits (be honest about these)
 
 - **PDF is best-effort**: embedded-image EXIF and exotic keys may survive. Strip the embedded images separately if provenance matters.
 - **Animated AVIF is refused** rather than silently collapsed — re-save the frames yourself and scrub those.
-- **HEIC/AVIF** still require `pip install pillow-heif` and are re-encoded, not byte-identical.
+- **HEIC/AVIF surgery is pure bytes** (no pillow-heif needed), but *opening* a HEIC for inspect/rebuild still requires `pip install exifwipe[heif]`. An AVIF container that the surgery can't fully parse falls back to a clean re-encode instead of being left dirty.
+- **RAF (Fuji)** is lossless for the carriers we know (header strings, embedded-JPEG EXIF, FujiIFD). Fuji occasionally changes the layout between models — if the preview or IFD doesn't parse, the file is **refused**, not half-wiped.
 - Decompression bombs are refused by default (`--max-pixels N` to raise the 178M-pixel limit, `0` for unlimited), including a cumulative budget across animation frames.
+- NEF/ARW/ORF/RW2/PEF are told apart from plain TIFF by MakerNote vendor prefixes — an extensionless NEF with a Nikon MakerNote is caught; an extensionless generic TIFF with none stays a TIFF.
 
 ## Why not just exiftool / mat2?
 

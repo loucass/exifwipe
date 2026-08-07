@@ -258,7 +258,7 @@ except ImportError:
     pillow_heif = None
 
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __author__ = "loucas"
 __github__ = "loucass"
 __license__ = "MIT"
@@ -2888,7 +2888,10 @@ def run_interactive_menu() -> int:
         print_top_banner()
         choice = menu_choose(keep_icc, dry_run).strip().lower()
         if choice in ("q", "quit", "exit", ""):
-            print(c_dim("    later."))
+            # clear the TUI off the screen, then sign off
+            _clear_screen()
+            print(c_blue("    0x-goodbye — metadata wiped, pixels clean."))
+            print(c_dim("    now go post it before someone else does."))
             return 0
         if choice == "5":
             keep_icc = not keep_icc
