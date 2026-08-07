@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exifwipe"
+version = "1.0.0"
+description = "Strip EXIF, GPS, XMP and MakerNotes from images/PDFs so exiftool returns blank."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "loucas" }]
+keywords = ["osint", "exif", "metadata", "privacy", "exiftool"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Security",
+]
+dependencies = [
+    "Pillow>=8.0",
+]
+# runtime-optional (degrade gracefully, loader prints install hint):
+#   piexif       -> JPEG round-trip verify
+#   pillow-heif  -> HEIC / AVIF input
+#   pikepdf      -> PDF DocInfo + XMP strip
+
+[project.scripts]
+exifwipe = "exifwipe:main"
+
+[tool.setuptools]
+py-modules = ["exifwipe"]
