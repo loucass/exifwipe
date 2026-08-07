@@ -928,6 +928,83 @@ def _apply_orientation(img, strict: bool = False):
         return img
 
 
+def _jpeg_orientation_from_bytes(data: bytes) -> Optional[int]:
+    """EXIF Orientation (0x0112, IFD0) read straight off the APP1 segment
+    — no pixel decode, no Pillow open. Returns 1 when there's no
+    rotation (or no EXIF at all), None only when the stream isn't a
+    JPEG. This is what lets the common JPEG case skip decode entirely."""
+    if data[:2] != b"\xff\xd8":
+        return None
+    i, n = 2, len(data)
+    while i + 4 <= n:
+        if data[i] != 0xFF:
+            break
+        while i < n and data[i] == 0xFF:
+            i += 1
+        if i >= n:
+            break
+        marker = data[i]
+        i += 1
+        if marker in (0xDA, 0xD9):
+            break
+        if i + 2 > n:
+            break
+        seg_len = int.from_bytes(data[i:i + 2], "big")
+        if seg_len < 2 or i + seg_len > n:
+            break
+        payload = data[i + 2:i + seg_len]
+        if marker == 0xE1 and payload.startswith(b"Exif\x00\x00"):
+            tiff = payload[6:]
+            bo = ("little" if tiff[:2] == b"II"
+                  else "big" if tiff[:2] == b"MM" else None)
+            if bo and len(tiff) >= 10 and int.from_bytes(tiff[2:4], bo) == 42:
+                ifd0 = int.from_bytes(tiff[4:8], bo)
+                if ifd0 + 2 <= len(tiff):
+                    cnt = int.from_bytes(tiff[ifd0:ifd0 + 2], bo)
+                    p = ifd0 + 2
+                    for _ in range(min(cnt, 512)):
+                        if p + 12 > len(tiff):
+                            break
+                        tag = int.from_bytes(tiff[p:p + 2], bo)
+                        typ = int.from_bytes(tiff[p + 2:p + 4], bo)
+                        if tag == 0x0112 and typ == 3:
+                            return int.from_bytes(tiff[p + 8:p + 10], bo) or 1
+                        p += 12
+            break
+        i += seg_len
+    return 1
+
+
+def _jpeg_sof_size(data: bytes):
+    """(width, height) from the first SOF marker, without decoding pixels
+    (the bomb guard wants dimensions, not a full decode)."""
+    i, n = 2, len(data)
+    while i + 4 <= n:
+        if data[i] != 0xFF:
+            break
+        while i < n and data[i] == 0xFF:
+            i += 1
+        if i >= n:
+            break
+        marker = data[i]
+        i += 1
+        if marker == 0xDA:
+            break
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            if i + 7 > n:
+                return None
+            h = int.from_bytes(data[i + 3:i + 5], "big")
+            w = int.from_bytes(data[i + 5:i + 7], "big")
+            return (w, h)
+        if i + 2 > n:
+            break
+        seg_len = int.from_bytes(data[i:i + 2], "big")
+        if seg_len < 2:
+            break
+        i += seg_len
+    return None
+
+
 def strip_image_bytes(path: Path, keep_icc: bool = False,
                       max_pixels: Optional[int] = None) -> tuple[bytes, str]:
     """Strip metadata, keeping pixels as close to byte-identical as the
@@ -935,7 +1012,10 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
 
     JPEG (orientation-neutral): rewrite the marker stream — drop every
     APPn/COM segment (EXIF, XMP, Photoshop, ICC unless --keep-icc),
-    keep the entropy-coded pixel data verbatim. No re-encode, no loss.
+    keep the entropy-coded pixel data verbatim. No re-encode, no loss —
+    and no pixel decode at all: orientation + dimensions come straight
+    off the marker stream, so the common case never touches pixels.
+    Multi-frame streams (MPO) and trailing garbage after EOI are handled.
 
     JPEG (needs rotation) and everything else: bake the rotation (if
     any) into the pixels, then rebuild into a brand-new frame with an
@@ -952,9 +1032,7 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
 
     Animated GIF / APNG / multipage TIFF / animated WebP keep every
     frame, timing and loop (APNG + lossless WebP are stripped losslessly).
-    Animated AVIF is refused loudly. Multi-frame JPEG (MPO) with a
-    rotated frame 0 bakes the rotation in and keeps every other frame
-    lossless — never drops them.
+    Animated AVIF is refused loudly.
 
     `max_pixels` guards against decompression bombs: images larger than
     the limit (per frame, and a cumulative budget across animation
@@ -966,11 +1044,60 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
         max_pixels = DEFAULT_MAX_PIXELS
     raw = path.read_bytes()
     # TIFF family -> lossless in-place surgery. NEVER re-encode sensor
-    # data: pixels byte-identical, pages kept, no encode cost.
+    # data: every axis favors the surgery (pixels byte-identical, pages
+    # kept, no encode cost).
     if raw[:4] in (b"II*\x00", b"MM\x00*") and _is_tiff_family(raw):
         surg = _tiff_strip_lossless(raw, keep_icc)
         if surg is not None:
             return surg, "tiff"
+        # unparseable TIFF: fall through to Pillow's rebuild as a last resort
+
+    # JPEG family -> fast path: orientation and dimensions straight from
+    # the marker stream. Orientation-neutral JPEGs are stripped without
+    # a single pixel being decoded — the old code decoded the whole
+    # photo just to check a tag it could read from the APP1 bytes.
+    if raw[:2] == b"\xff\xd8":
+        orient = _jpeg_orientation_from_bytes(raw)
+        n_frames = raw.count(b"\xff\xd8")
+        # bomb guard without decoding: dimensions come off the SOF marker
+        dims = _jpeg_sof_size(raw)
+        if max_pixels and dims and dims[0] * dims[1] > max_pixels:
+            raise RuntimeError(
+                f"refusing to process {dims[0]}x{dims[1]} = "
+                f"{dims[0]*dims[1]:,} pixels (limit {max_pixels:,}); "
+                "pass --max-pixels N to raise the limit (memory risk)")
+        if orient != 1 and n_frames > 1:
+            # rotated multi-frame (MPO): bake frame 0's rotation, keep
+            # every other frame lossless — NEVER drop them
+            with Image.open(path) as img:
+                if max_pixels and (img.size[0] * img.size[1] * n_frames
+                                   > max_pixels * 8):
+                    raise RuntimeError(
+                        f"refusing: ~{img.size[0]*img.size[1]*n_frames:,} "
+                        f"total pixels across {n_frames} frames "
+                        f"(cumulative limit {max_pixels*8:,})")
+                mpo = _strip_mpo_rotated_first(raw, img, keep_icc)
+                if mpo is None:
+                    raise RuntimeError(
+                        "multi-frame JPEG needs rotation but its frames "
+                        "could not be split — refusing to drop them")
+                return mpo, "jpeg"
+        if orient == 1:
+            lossless = _strip_jpeg_lossless(raw, keep_icc)
+            if lossless is not None:
+                return _jpeg_final_check(lossless, keep_icc), "jpeg"
+        # single-frame rotation to bake: pixel rebuild
+        with Image.open(path) as img:
+            img.load()
+            w, h = img.size
+            if max_pixels and w * h > max_pixels:
+                raise RuntimeError(
+                    f"refusing to process {w}x{h} = {w*h:,} pixels "
+                    f"(limit {max_pixels:,}); pass --max-pixels N to raise "
+                    "the limit (memory risk)")
+            rebuilt = _rebuild_jpeg_from_img(img, keep_icc)
+            return rebuilt, "jpeg"
+
     with Image.open(path) as img:
         w, h = img.size
         if max_pixels and w * h > max_pixels:
@@ -1019,25 +1146,6 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
                 return lossless, "png"
             if n_frames > 1:
                 return _strip_multiframe(img, "PNG", keep_icc=keep_icc)
-
-        # JPEG / MPO: prefer the lossless marker-stream strip. Only when
-        # the photo is orientation-neutral — otherwise we must bake the
-        # rotation into the pixels, which requires re-encoding.
-        if fmt in ("JPEG", "JPG", "MPO"):
-            n_jpeg = raw.count(b"\xff\xd8")
-            if n_jpeg > 1 and not _orientation_is_neutral(img):
-                # rotated multi-frame (MPO): bake frame 0's rotation,
-                # keep every other frame lossless — NEVER drop them
-                mpo = _strip_mpo_rotated_first(raw, img, keep_icc)
-                if mpo is None:
-                    raise RuntimeError(
-                        "multi-frame JPEG needs rotation but its frames "
-                        "could not be split — refusing to drop them")
-                return mpo, "jpeg"
-            if _orientation_is_neutral(img):
-                lossless = _strip_jpeg_lossless(raw, keep_icc)
-                if lossless is not None:
-                    return _jpeg_final_check(lossless, keep_icc), "jpeg"
 
         img = _apply_orientation(img, strict=fmt in ("JPEG", "JPG", "MPO"))
 
@@ -1124,6 +1232,7 @@ def _orientation_is_neutral(img) -> bool:
             return True
         return int(img.getexif().get(0x0112, 1) or 1) == 1
     except Exception:
+        # can't read EXIF -> assume no orientation to honor
         return True
 
 
