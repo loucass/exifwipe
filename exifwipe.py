@@ -578,11 +578,10 @@ def strip_pdf_bytes(path: Path) -> bytes:
             pdf.save(buf)
             return buf.getvalue()
     except Exception as e:
-        print(
-            f"  {c_err('[ERR]')} {c_warn(path.name)}: "
-            f"PDF strip failed: {e}",
-            file=sys.stderr,
-        )
+        # corrupt / encrypted / half-written PDF — be a failure, not a
+        # silent "processed" (caller uses return b"" to skip the write)
+        print(f"  {c_err('[ERR]')} {c_warn(path.name)}: PDF strip failed: {e}",
+              file=sys.stderr)
         return b""
 
 
@@ -635,7 +634,10 @@ def handle_one(path: Path, args: argparse.Namespace) -> bool:
             print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
             return False
         if args.verbose:
-            inspect_image(path if args.output is None else args.output / path.name)
+            try:
+                inspect_image(path if args.output is None else args.output / path.name)
+            except Exception as e:
+                print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
         return True
 
     if sfx in DOC_EXTS:
