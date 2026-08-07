@@ -695,14 +695,12 @@ def prompt_input(label: str) -> str:
         return ""
 
 
-def _run_menu_action(action: str, path: Path, keep_icc: bool) -> None:
+def _run_menu_action(action: str, path: Path, keep_icc: bool, dry_run: bool) -> None:
     """Run one interactive operation against a path (reuses handle_one)."""
-    ns = argparse.Namespace(output=None, keep_icc=keep_icc, dry_run=False,
+    ns = argparse.Namespace(output=None, keep_icc=keep_icc, dry_run=dry_run,
                             inspect=False, verbose=False)
     if action == "inspect":
         ns.inspect = True
-    elif action == "dry":
-        ns.dry_run = True
 
     targets = list(iter_inputs(path))
     if not targets:
@@ -761,7 +759,7 @@ def run_interactive_menu() -> int:
         action = {"1": "strip", "2": "strip", "3": "inspect", "4": "dry"}[choice]
         if action == "dry":
             dry_run = True
-        _run_menu_action(action, path, keep_icc)
+        _run_menu_action(action, path, keep_icc, dry_run)
 
 
 # --------------------------------------------------------------------------- #
