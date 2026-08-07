@@ -161,8 +161,10 @@ r"""
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import os
+import random
 import stat
 import sys
 from pathlib import Path
@@ -968,6 +970,8 @@ def print_formats_matrix() -> None:
         ("raw-orient", "Orientation kept (display-only, sensor can't be "
                       "re-rotated); --drop-orientation blanks it",
                       "opt-in removal"),
+        ("--perturb", "seeded +-N pixel noise on rebuild paths",
+                      "breaks naive reverse-search; NOT unlinkability"),
         ("pdf",       "pikepdf: /Info + /Metadata + /Lang/JS/PageLabels",
                       "BEST-EFFORT: embedded-image EXIF may survive"),
     ]
@@ -993,6 +997,58 @@ def _apply_orientation(img, strict: bool = False):
             raise RuntimeError(
                 f"failed to bake EXIF orientation into pixels: {e}") from e
         return img
+
+
+def _perturb_seed(path: Path, raw: bytes) -> int:
+    """Deterministic per-file seed: same input file -> same perturbed
+    output every run (reproducible results, no surprise re-diffs)."""
+    try:
+        return int.from_bytes(hashlib.blake2b(
+            str(path).encode("utf-8", "surrogateescape") + raw[:4096],
+            digest_size=8).digest(), "little")
+    except Exception:
+        return 0xC0FFEE
+
+
+def _perturb_image(img, seed: int, level: int):
+    """Deterministic low-amplitude pixel noise (opt-in anti-reverse-search).
+
+    Changes the color channels of every pixel by +-`level` (clamped),
+    driven by a seeded RNG through a small repeated pattern applied
+    tile-by-tile, so memory stays bounded on giant photos and the alpha
+    band is never touched. This is NOT cryptography: it breaks naive
+    exact/feature matching against the original and nothing more."""
+    if level <= 0:
+        return img
+    rng = random.Random(seed)
+    bands = img.split()
+    keep_alpha = img.mode in ("RGBA", "LA")
+    color = bands[:-1] if keep_alpha else bands
+    from PIL import ImageChops
+    out_bands = []
+    for b in color:
+        # per-band pattern from the same seeded rng — deterministic
+        pat_pos = Image.new("L", (64, 64))
+        pat_neg = Image.new("L", (64, 64))
+        pp, pn = pat_pos.load(), pat_neg.load()
+        for y in range(64):
+            for x in range(64):
+                d = rng.randint(-level, level)
+                pp[x, y] = max(d, 0)
+                pn[x, y] = -min(d, 0)
+        w, h = b.size
+        res = Image.new("L", b.size)
+        for y in range(0, h, 512):
+            for x in range(0, w, 512):
+                box = (x, y, min(x + 512, w), min(y + 512, h))
+                tile = b.crop(box)
+                p = pat_pos.resize(tile.size, Image.NEAREST)
+                n = pat_neg.resize(tile.size, Image.NEAREST)
+                res.paste(ImageChops.subtract(ImageChops.add(tile, p), n), box)
+        out_bands.append(res)
+    if keep_alpha:
+        out_bands.append(bands[-1])
+    return Image.merge(img.mode, out_bands)
 
 
 def _jpeg_orientation_from_bytes(data: bytes) -> Optional[int]:
@@ -1074,7 +1130,8 @@ def _jpeg_sof_size(data: bytes):
 
 def strip_image_bytes(path: Path, keep_icc: bool = False,
                       max_pixels: Optional[int] = None,
-                      drop_orientation: bool = False) -> tuple[bytes, str]:
+                      drop_orientation: bool = False,
+                      perturb: Optional[int] = None) -> tuple[bytes, str]:
     """Strip metadata, keeping pixels as close to byte-identical as the
     format allows.
 
@@ -1107,6 +1164,9 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
     frames) are refused loudly instead of being decoded into RAM.
     `drop_orientation` additionally blanks the RAW/TIFF Orientation tag
     (kept by default: display-only, sensor pixels can't be re-rotated).
+    `perturb` (1-4) applies deterministic low-amplitude noise to rebuilt
+    pixels so reverse-image search can't match the original — opt-in,
+    and it does change pixels slightly.
 
     Returns (clean_bytes, output_format_lowercase).
     """
@@ -1129,6 +1189,7 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
     if raw[:2] == b"\xff\xd8":
         orient = _jpeg_orientation_from_bytes(raw)
         n_frames = raw.count(b"\xff\xd8")
+        seed = _perturb_seed(path, raw) if perturb else 0
         # bomb guard without decoding: dimensions come off the SOF marker
         dims = _jpeg_sof_size(raw)
         if max_pixels and dims and dims[0] * dims[1] > max_pixels:
@@ -1146,17 +1207,18 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
                         f"refusing: ~{img.size[0]*img.size[1]*n_frames:,} "
                         f"total pixels across {n_frames} frames "
                         f"(cumulative limit {max_pixels*8:,})")
-                mpo = _strip_mpo_rotated_first(raw, img, keep_icc)
+                mpo = _strip_mpo_rotated_first(raw, img, keep_icc,
+                                               perturb, seed)
                 if mpo is None:
                     raise RuntimeError(
                         "multi-frame JPEG needs rotation but its frames "
                         "could not be split — refusing to drop them")
                 return mpo, "jpeg"
-        if orient == 1:
+        if orient == 1 and not perturb:
             lossless = _strip_jpeg_lossless(raw, keep_icc)
             if lossless is not None:
                 return _jpeg_final_check(lossless, keep_icc), "jpeg"
-        # single-frame rotation to bake: pixel rebuild
+        # single-frame rotation to bake (or --perturb): pixel rebuild
         with Image.open(path) as img:
             img.load()
             w, h = img.size
@@ -1165,7 +1227,7 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
                     f"refusing to process {w}x{h} = {w*h:,} pixels "
                     f"(limit {max_pixels:,}); pass --max-pixels N to raise "
                     "the limit (memory risk)")
-            rebuilt = _rebuild_jpeg_from_img(img, keep_icc)
+            rebuilt = _rebuild_jpeg_from_img(img, keep_icc, perturb, seed)
             return rebuilt, "jpeg"
 
     with Image.open(path) as img:
@@ -1196,18 +1258,22 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
                 f"refusing: ~{w*h*n_frames:,} total pixels across "
                 f"{n_frames} frames (cumulative limit {max_pixels*8:,})"
             )
+        seed = _perturb_seed(path, raw) if perturb else 0
 
         # GIF: prefer the byte-level strip — it keeps every frame,
         # palette, transparency and disposal EXACTLY as-is (no
         # P→RGBA→re-quantize round-trip) and only drops comment + XMP
         # application extensions wherever they appear in the stream.
-        # Fall back to a rebuild if the stream doesn't parse.
+        # Fall back to a rebuild if the stream doesn't parse. (--perturb
+        # forces the rebuild — changing pixels is the whole point.)
         if fmt == "GIF":
-            lossless = _strip_gif_lossless(raw)
-            if lossless is not None:
-                return lossless, "gif"
+            if not perturb:
+                lossless = _strip_gif_lossless(raw)
+                if lossless is not None:
+                    return lossless, "gif"
             if n_frames > 1:
-                return _strip_multiframe(img, fmt, keep_icc=keep_icc)
+                return _strip_multiframe(img, fmt, keep_icc=keep_icc,
+                                         perturb=perturb, seed=seed)
 
         webp_lossless = fmt == "WEBP" and _webp_is_lossless(raw)
 
@@ -1215,17 +1281,20 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
         # keep the animation
         if fmt in ("TIFF", "TIF", "WEBP", "AVIF") and n_frames > 1:
             return _strip_multiframe(img, fmt, keep_icc=keep_icc,
-                                     webp_lossless=webp_lossless)
+                                     webp_lossless=webp_lossless,
+                                     perturb=perturb, seed=seed)
 
         # APNG: lossless chunk strip (animation + pixels byte-exact).
         # The old code rebuilt through the single-frame path and silently
         # collapsed every animated PNG to frame 1.
         if fmt == "PNG" and _png_is_animated(raw):
-            lossless = _strip_png_lossless(raw)
-            if lossless is not None:
-                return lossless, "png"
+            if not perturb:
+                lossless = _strip_png_lossless(raw)
+                if lossless is not None:
+                    return lossless, "png"
             if n_frames > 1:
-                return _strip_multiframe(img, "PNG", keep_icc=keep_icc)
+                return _strip_multiframe(img, "PNG", keep_icc=keep_icc,
+                                         perturb=perturb, seed=seed)
 
         img = _apply_orientation(img, strict=fmt in ("JPEG", "JPG", "MPO"))
 
@@ -1235,6 +1304,8 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
             img = img.convert(mode)
 
         clean = _rebuild_frame(img, mode)
+        if perturb:
+            clean = _perturb_image(clean, seed, perturb)
 
         icc_bytes = b""
         if keep_icc:
@@ -1440,7 +1511,8 @@ def _jpeg_final_check(cleaned: bytes, keep_icc: bool = False) -> bytes:
     )
 
 
-def _rebuild_jpeg_from_img(img, keep_icc: bool = False) -> bytes:
+def _rebuild_jpeg_from_img(img, keep_icc: bool = False, perturb=None,
+                           seed: int = 0) -> bytes:
     """Bake orientation into pixels, rebuild a clean q95 JPEG frame."""
     img = _apply_orientation(img, strict=True)
     mode = img.mode
@@ -1448,6 +1520,8 @@ def _rebuild_jpeg_from_img(img, keep_icc: bool = False) -> bytes:
         mode = "RGBA" if ("A" in mode or mode == "P") else "RGB"
         img = img.convert(mode)
     clean = _rebuild_frame(img, mode)
+    if perturb:
+        clean = _perturb_image(clean, seed, perturb)
     icc = b""
     if keep_icc:
         try:
@@ -1460,7 +1534,8 @@ def _rebuild_jpeg_from_img(img, keep_icc: bool = False) -> bytes:
     return _jpeg_final_check(buf.getvalue(), keep_icc)
 
 
-def _strip_mpo_rotated_first(raw: bytes, img, keep_icc: bool = False):
+def _strip_mpo_rotated_first(raw: bytes, img, keep_icc: bool = False,
+                             perturb=None, seed: int = 0):
     """Multi-frame JPEG whose FIRST frame carries a rotation: re-encode
     frame 0 with the rotation baked in, then lossless-strip the remaining
     frames so no frame is ever silently dropped. Returns None when the
@@ -1472,7 +1547,7 @@ def _strip_mpo_rotated_first(raw: bytes, img, keep_icc: bool = False):
     rest = raw[len(f0):]
     try:
         img.seek(0)
-        clean0 = _rebuild_jpeg_from_img(img, keep_icc)
+        clean0 = _rebuild_jpeg_from_img(img, keep_icc, perturb, seed)
     except Exception as e:
         raise RuntimeError(
             f"multi-frame JPEG needs rotation and frame 0 could not be "
@@ -1789,7 +1864,8 @@ def _webp_is_lossless(data: bytes) -> bool:
 
 
 def _strip_multiframe(img, fmt: str, keep_icc: bool = False,
-                      webp_lossless: bool = False) -> tuple[bytes, str]:
+                      webp_lossless: bool = False, perturb=None,
+                      seed: int = 0) -> tuple[bytes, str]:
     """Rebuild every frame of an animated GIF / APNG / multipage TIFF /
     animated WebP / AVIF from pixels, dropping all per-frame metadata."""
     n = getattr(img, "n_frames", 1)
@@ -1801,7 +1877,10 @@ def _strip_multiframe(img, fmt: str, keep_icc: bool = False,
         if mode not in ("RGB", "RGBA", "L"):
             mode = "RGBA" if ("A" in mode or mode == "P") else "RGB"
             fr = fr.convert(mode)
-        frames.append(_rebuild_frame(fr, mode))
+        clean = _rebuild_frame(fr, mode)
+        if perturb:
+            clean = _perturb_image(clean, seed, perturb)
+        frames.append(clean)
         durations.append(int(fr.info.get("duration", 100) or 100))
         disposal.append(int(fr.info.get("disposal", 2)))
     buf = io.BytesIO()
@@ -2398,6 +2477,7 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
 
     no_clobber = bool(getattr(args, "no_clobber", False))
     drop_orientation = bool(getattr(args, "drop_orientation", False))
+    perturb = getattr(args, "perturb", None)
 
     if fmt == "raf":
         # Fuji RAF is NOT a TIFF container, but it is writable losslessly:
@@ -2467,7 +2547,8 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
             cleaned, fmt_out = strip_image_bytes(
                 path, keep_icc=args.keep_icc,
                 max_pixels=getattr(args, "max_pixels", None),
-                drop_orientation=drop_orientation)
+                drop_orientation=drop_orientation,
+                perturb=perturb)
             write_output(path, args.output, cleaned, no_clobber=no_clobber)
         except Exception as e:
             print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
@@ -2685,6 +2766,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--drop-orientation", action="store_true",
                    help="RAW/TIFF only: also blank the Orientation tag "
                         "(kept by default — display instruction, not identity)")
+    p.add_argument("--perturb", nargs="?", const=2, type=int, default=None,
+                   metavar="LEVEL",
+                   help="slightly change pixels (+-LEVEL, 1-4, default 2) "
+                        "so reverse-image search can't match the original — "
+                        "deterministic, opt-in, rebuild paths only")
     p.add_argument("--formats", action="store_true",
                    help="print what formats are guaranteed clean "
                       "vs best-effort, then exit")
@@ -2705,6 +2791,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
     set_color(args.color)
+
+    if args.perturb is not None and not (1 <= args.perturb <= 4):
+        print(f"  [ERR] --perturb level must be 1-4, got {args.perturb}",
+              file=sys.stderr)
+        return 2
 
     # --formats / --version don't need an input at all
     if args.formats:
