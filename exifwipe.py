@@ -348,6 +348,16 @@ def strip_image_bytes(path: Path, keep_icc: bool = False) -> tuple[bytes, str]:
                 and getattr(img, "n_frames", 1) > 1:
             return _strip_multiframe(img, fmt, keep_icc=keep_icc)
 
+        # GIF: prefer the byte-level strip — it keeps every frame,
+        # palette, transparency and disposal EXACTLY as-is (no
+        # P→RGBA→re-quantize round-trip) and only drops comment +
+        # XMP application extensions. Fall back to rebuild if the
+        # stream doesn't parse.
+        if fmt == "GIF":
+            lossless = _strip_gif_lossless(path.read_bytes())
+            if lossless is not None:
+                return lossless, "gif"
+
         # JPEG: prefer the lossless marker-stream strip. Only when the
         # photo is orientation-neutral — otherwise we must bake the
         # rotation into the pixels, which requires re-encoding.
@@ -541,6 +551,75 @@ def _strip_jpeg_lossless(data: bytes, keep_icc: bool = False):
     if not saw_frame:
         return None
     return bytes(out)
+
+
+def _strip_gif_lossless(data: bytes):
+    """Rewrite a GIF stream, dropping comment blocks (0x21 0xFE) and
+    XMP application extensions (0x21 0xFF 'XMP DataXMP'), keeping the
+    image/frame descriptors, palettes, transparency, disposal and loop
+    count byte-identical. Returns None if the stream doesn't parse.
+
+    GIF blocks that can carry metadata:
+      0x21 0xFE ...   comment extension        — dropped
+      0x21 0xFF ...   application extension   — dropped only if it
+                        carries XMP; NETSCAPE loop is kept
+      0x21 0xF9 ...   graphic control (disposal + transparency) — kept
+      0x2C ...        image data               — kept verbatim
+    """
+    if data[:6] not in (b"GIF87a", b"GIF89a"):
+        return None
+    n = len(data)
+    out = bytearray(data[:6])
+    i = 6
+    if i + 7 > n:
+        return None
+    lsdesc = data[i:i + 7]
+    out += lsdesc
+    i += 7
+    if lsdesc[4] & 0x80:                    # global color table
+        gct_size = 3 * (2 ** ((lsdesc[4] & 0x07) + 1))
+        if i + gct_size > n:
+            return None
+        out += data[i:i + gct_size]
+        i += gct_size
+
+    while i < n:
+        if data[i] == 0x3B or data[i] == 0x2C:
+            # trailer or image descriptor — nothing left to scrub
+            # after an image block except more image blocks, so
+            # keep the rest verbatim
+            out += data[i:]
+            return bytes(out)
+        if data[i] != 0x21:
+            return None                     # unknown top-level byte
+        if i + 2 > n:
+            return None
+        label = data[i + 1]
+        start = i
+        i = _skip_gif_subblocks(data, i + 2)
+        if i is None:
+            return None
+        block = data[start:i]
+        if label == 0xFE:
+            continue                        # comment — drop
+        if label == 0xFF and block.startswith(b"\x21\xffXMP Data"):
+            continue                        # XMP application ext — drop
+        out += block                        # GCE / NETSCAPE / others
+    return bytes(out)
+
+
+def _skip_gif_subblocks(data: bytes, idx: int):
+    """Return index just past a GIF sub-block chain; None if malformed."""
+    n = len(data)
+    while True:
+        if idx >= n:
+            return None
+        size = data[idx]
+        if size == 0:
+            return idx + 1
+        if idx + 1 + size > n:
+            return None
+        idx += 1 + size
 
 
 def _rebuild_frame(img, mode: str):
