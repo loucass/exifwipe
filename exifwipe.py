@@ -899,17 +899,46 @@ def strip_pdf_bytes(path: Path) -> bytes:
 # --------------------------------------------------------------------------- #
 # driver
 # --------------------------------------------------------------------------- #
+def _atomic_write_bytes(path: Path, cleaned: bytes, st) -> None:
+    """Write `cleaned` to `path` atomically via a private temp file that
+    only we created (O_EXCL — no attacker can pre-plant a symlink at a
+    predictable name), fsync it, then rename over the original.
+
+    Mode and mtime of the original are preserved on the new inode so a
+    0600 private photo stays 0600.
+    """
+    import secrets
+    for _ in range(10):
+        tmp = path.with_name(f".{path.name}.exifwipe_tmp_{secrets.token_hex(8)}")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue            # collision — try another random name
+        except OSError as e:
+            raise OSError(f"cannot create temp file for {path.name}: {e}") from e
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(cleaned)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        os.chmod(tmp, st.st_mode)
+        os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+        os.replace(tmp, path)
+        return
+    raise OSError(f"could not reserve a unique temp name for {path.name}")
+
+
 def write_output(src: Path, out: Optional[Path], cleaned: bytes) -> None:
     """Either overwrite src in place, or write to `out` (file or dir)."""
     if out is None:
-        # atomic-ish: write new inode, then rename over the original.
-        # Preserve mode + mtime so a 0600 private photo stays 0600.
         st = src.stat()
-        tmp = src.with_suffix(src.suffix + ".exifwipe_tmp")
-        tmp.write_bytes(cleaned)
-        os.chmod(tmp, st.st_mode)
-        os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
-        os.replace(tmp, src)
+        _atomic_write_bytes(src, cleaned, st)
         print(f"  {c_ok('[STRIPPED]')} {c_head(str(src))}")
     else:
         # if user passed a folder or a path-without-suffix, drop src inside
