@@ -455,36 +455,75 @@ def _strip_jpeg_lossless(data: bytes, keep_icc: bool = False):
     (EXIF, XMP, Photoshop, ICC unless keep_icc). Entropy-coded pixel
     data is copied verbatim — no re-encode, no quality loss.
 
+    Handles multi-frame images (MPO et al.) by parsing each SOI..EOI
+    pair, and drops any trailing garbage after the final EOI (bytes
+    appended past the end of the image, e.g. by file-carving tools).
+
     Returns None if the stream doesn't parse as a normal JPEG (caller
     then falls back to the pixel-rebuild path)."""
     if data[:2] != b"\xff\xd8":
         return None
-    out = bytearray(b"\xff\xd8")
-    i, n = 2, len(data)
+    n = len(data)
+    out = bytearray()
+    i = 0
+    saw_frame = False
+
+    def scan_entropy(j: int) -> int:
+        """Copy entropy-coded bytes verbatim until the next real
+        marker. Returns the index of that marker (which the outer
+        loop then processes). Handles FF 00 stuffing and RSTn."""
+        nonlocal out
+        while j < n:
+            if data[j] != 0xFF:
+                j += 1
+                continue
+            k = j
+            while k < n and data[k] == 0xFF:
+                k += 1
+            if k >= n:                      # run of FF to EOF — truncated
+                out += data[j:k]
+                return n
+            nxt = data[k]
+            if nxt == 0x00 or 0xD0 <= nxt <= 0xD7:
+                # stuffed FF 00, or RSTn restart marker — part of the
+                # entropy stream, keep byte-exact
+                out += data[j:k + 1]
+                j = k + 1
+                continue
+            # first real marker after entropy
+            out += data[j:k]
+            return k - 1
+        return n
+
     while i < n:
         if data[i] != 0xFF:
-            return None
+            # trailing garbage after the last EOI — drop it
+            break
         while i < n and data[i] == 0xFF:
             i += 1
         if i >= n:
-            return None
+            break
         marker = data[i]
         i += 1
-        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
-            # SOI / TEM / RSTn — nothing to keep or drop here
+        if marker == 0xD8:          # SOI — start of a frame
+            out += b"\xff\xd8"
+            saw_frame = True
             continue
-        if marker == 0xD9:  # EOI
+        if marker == 0xD9:          # EOI
             out += b"\xff\xd9"
-            return bytes(out)
+            continue
+        if 0xD0 <= marker <= 0xD7 or marker == 0x01:
+            continue                # RSTn / TEM, only valid inside entropy
         if i + 2 > n:
-            return None
+            continue                # truncated segment header
         seg_len = int.from_bytes(data[i:i + 2], "big")
-        if i + seg_len > n:
-            return None
-        if marker == 0xDA:  # SOS — entropy-coded data follows verbatim
-            out += b"\xff\xda" + data[i:i + seg_len] + data[i + seg_len:]
-            return bytes(out)
+        if seg_len < 2 or i + seg_len > n:
+            continue
         payload = data[i + 2:i + seg_len]
+        if marker == 0xDA:          # SOS — entropy-coded data follows
+            out += b"\xff\xda" + data[i:i + seg_len]
+            i = scan_entropy(i + seg_len)
+            continue
         keep = True
         if 0xE0 <= marker <= 0xEF:  # APP0..APP15
             keep = (
@@ -492,11 +531,13 @@ def _strip_jpeg_lossless(data: bytes, keep_icc: bool = False):
                 or (marker == 0xE2 and keep_icc
                     and payload.startswith(b"ICC_PROFILE\x00"))        # ICC, opt-in only
             )
-        elif marker == 0xFE:  # COM comment
+        elif marker == 0xFE:        # COM comment
             keep = False
         if keep:
             out += b"\xff" + bytes([marker]) + data[i:i + seg_len]
         i += seg_len
+    if not saw_frame:
+        return None
     return bytes(out)
 
 
