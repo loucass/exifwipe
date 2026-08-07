@@ -295,6 +295,15 @@ _SYSTEM_DIRS = {"etc", "usr", "bin", "sbin", "lib", "lib64", "boot",
 
 _RAF_MAGIC = b"FUJIFILMCCD-RAW "
 
+# MakerNote vendor prefixes -> RAW family, so extensionless NEF/ARW/ORF/
+# RW2/PEF/SRW and mislabeled .tiff files get the right container treatment
+# (they are structurally TIFF; only the MakerNote tells them apart).
+_MAKERNOTE_VENDORS = (
+    (b"Nikon", "nef"), (b"SONY", "arw"), (b"OLYMP", "orf"),
+    (b"Panasonic", "rw2"), (b"PENTAX", "pef"), (b"SAMSUNG", "srw"),
+    (b"Canon", "cr2"), (b"HASSELBLAD", "3fr"),
+)
+
 
 # --------------------------------------------------------------------------- #
 # inspection — print what exiftool would surface
@@ -661,6 +670,25 @@ def _tiff_has_tag(data: bytes, wanted: int) -> bool:
         if tag == wanted:
             return True
     return False
+
+
+def _tiff_vendor_from_makernote(data: bytes) -> Optional[str]:
+    """Identify a RAW family from its MakerNote prefix (Nikon/Sony/Olympus/
+    Panasonic/Pentax/Samsung/Canon/Hasselblad), so extensionless or
+    mislabeled TIFF-family files get the right treatment. Returns None
+    when there's no recognizable MakerNote."""
+    hdr = _tiff_parse_header(data)
+    if hdr is None:
+        return None
+    bo, magic = hdr
+    for (_, tag, typ, cnt, vf) in _iter_tiff_entries(data, bo, magic):
+        if tag != 0x927C:
+            continue
+        val = _tiff_value_bytes(data, bo, magic, typ, cnt, vf)
+        for prefix, fam in _MAKERNOTE_VENDORS:
+            if val.startswith(prefix):
+                return fam
+    return None
 
 
 def _is_tiff_family(data: bytes) -> bool:
@@ -2310,52 +2338,39 @@ def _sniff_bytes(data: bytes) -> Optional[str]:
 def _sniff_format(path: Path) -> Optional[str]:
     """Detect a file's real format from its magic bytes, not its name.
     Returns a normalized format name ('jpeg', 'png', 'gif', 'tiff',
-    'webp', 'bmp', 'heif', 'avif', 'pdf') or None if unrecognized."""
+    'webp', 'bmp', 'heif', 'avif', 'raf', 'pdf') or None if unrecognized.
+
+    TIFF-family files that aren't obviously CR2/DNG-by-extension get a
+    deep read: DNG by its DNGVersion tag, then RAW family by MakerNote
+    prefix — so an extensionless NEF or a .tiff that's really an ARW is
+    handled as the RAW it actually is."""
     try:
         head = path.open("rb").read(16)
     except OSError:
         return None
-    if head[:2] == b"\xff\xd8":
-        return "jpeg"
-    if head[:8] == b"\x89PNG\r\n\x1a\n":
-        return "png"
-    if head[:6] in (b"GIF87a", b"GIF89a"):
-        return "gif"
-    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-        return "webp"
-    if head[:16] == _RAF_MAGIC:
-        return "raf"          # Fuji — NOT a TIFF container
-    if head[:4] in (b"II*\x00", b"MM\x00*"):
-        # TIFF-family RAW containers are structurally TIFF; the extension
-        # (or a deep read below) tells them apart from a plain TIFF
-        ext = path.suffix.lower()
-        if ext in RAW_EXTENSIONS:
-            return ext.lstrip(".")
-        # CR2: 16-byte header (IFD0 at 0x10) + CR2 magic 0x0201 at offset 8
-        if (head[:8] == b"II*\x00\x10\x00\x00\x00"
-                and head[8:10] == b"\x01\x02"):
-            return "cr2"
-        # extensionless DNG: the DNGVersion tag (0xC612) is authoritative
-        try:
-            more = path.open("rb").read(1 << 20)
-        except OSError:
-            more = b""
-        if more and _tiff_has_tag(more, 0xC612):
-            return "dng"
+    fmt = _sniff_bytes(head)
+    if fmt != "tiff":
+        return fmt
+    ext = path.suffix.lower()
+    if ext == ".cr2":
+        return "cr2"
+    if ext == ".dng":
+        return "dng"
+    if ext in RAW_EXTENSIONS:
+        return ext.lstrip(".")
+    # anything else TIFF-family (extensionless, .tiff, or a .bin that's
+    # really a NEF): the extension is only a hint — the DNGVersion tag
+    # and the MakerNote are authoritative
+    try:
+        more = path.open("rb").read(1 << 20)
+    except OSError:
+        more = b""
+    if not more:
         return "tiff"
-    if head[:2] == b"BM":
-        return "bmp"
-    if head[:4] == b"%PDF":
-        return "pdf"
-    if head[4:8] == b"ftyp":
-        brand = head[8:12]
-        # HEIF/AVIF share the ISO BMFF container; disambiguate by brand
-        if brand in (b"avif", b"avis"):
-            return "avif"
-        if brand in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1",
-                     b"heif", b"heim"):
-            return "heif"
-    return None
+    if _tiff_has_tag(more, 0xC612):
+        return "dng"
+    vend = _tiff_vendor_from_makernote(more)
+    return vend if vend else "tiff"
 
 
 def handle_one(path: Path, args: argparse.Namespace) -> int:

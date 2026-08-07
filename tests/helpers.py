@@ -532,6 +532,32 @@ def mpo_rotated_first(path):
     return Path(path)
 
 
+def tiff_with_orientation(path, orient=6):
+    """TIFF carrying an Orientation tag + EXIF IFD (for --drop-orientation)."""
+    data = build_tiff(
+        [(0x010F, 2, "OrientCam"), (0x0112, 3, orient),
+         (0x8769, 4, ("ref", "exif"))],
+        exif=[(0x9003, 2, "2024:01:01 00:00:00")],
+        pixels=b"\x0a\x0b\x0c" * 64,
+    )
+    Path(path).write_bytes(data)
+    return Path(path)
+
+
+def nef_like_fixture(path):
+    """TIFF-family file with a Nikon MakerNote but NO .nef extension —
+    vendor detection must identify it as NEF from the MakerNote alone."""
+    data = build_tiff(
+        [(0x010F, 2, "NIKON D850"), (0x0110, 2, "SerialVendor"),
+         (0x8769, 4, ("ref", "exif"))],
+        exif=[(0x9003, 2, "2024:01:01 00:00:00"),
+              (0x927C, 7, b"Nikon\x00\x02\x10\x00")],
+        pixels=b"\x01\x02\x03" * 64,
+    )
+    Path(path).write_bytes(data)
+    return Path(path)
+
+
 def raf_fixture(path, with_preview=True, with_fuji_ifd=True,
                 model=b"FinePix S3Pro", serial=b"FA392001"):
     """Synthetic Fuji RAF matching exiftool's layout (FujiFilm.pm): a

@@ -1,10 +1,12 @@
 """JPEG fast path: orientation + dimensions come off the marker stream,
-so the common orientation-neutral case never decodes a pixel."""
+so the common orientation-neutral case never decodes a pixel; plus
+vendor-based RAW detection from MakerNotes for extensionless RAWs."""
 
 import io
 
 import exifwipe
-from helpers import assert_jpeg_clean, jpeg_with_exif
+from helpers import (assert_jpeg_clean, dng_fixture, jpeg_with_exif,
+                     nef_like_fixture)
 from PIL import Image
 
 
@@ -61,3 +63,28 @@ def test_neutral_jpeg_fast_path_keeps_entropy_bytes(tmp_path):
         "fast path must not re-encode pixels"
     with Image.open(io.BytesIO(clean)) as im:
         assert im.size == (96, 64)
+
+
+# -- vendor-based RAW detection ---------------------------------------------- #
+def test_extensionless_nef_detected_by_makernote(tmp_path):
+    src = nef_like_fixture(tmp_path / "camera.bin")
+    assert exifwipe._sniff_format(src) == "nef", \
+        "MakerNote must identify the RAW family with no extension"
+    args = exifwipe.build_parser().parse_args([str(src)])
+    assert exifwipe.handle_one(src, args) == exifwipe.R_OK
+    out = src.read_bytes()
+    assert b"NIKON D850" not in out
+    assert b"SerialVendor" not in out
+    assert exifwipe._tiff_find_identifying(out) == []
+
+
+def test_dng_without_extension_still_dng(tmp_path):
+    src = dng_fixture(tmp_path / "photo.bin")
+    assert exifwipe._sniff_format(src) == "dng", \
+        "DNGVersion tag must identify DNG without an extension"
+
+
+def test_plain_tiff_untouched_by_vendor_detection(tmp_path):
+    from helpers import multipage_tiff
+    src = multipage_tiff(tmp_path / "scan.bin")
+    assert exifwipe._sniff_format(src) == "tiff"
