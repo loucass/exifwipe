@@ -112,12 +112,12 @@ Four layers, because "just one" quietly fails sometimes:
 
 | format | in (KB) | out (KB) | ms/op | MB/s |
 |--------|--------:|---------:|------:|-----:|
-| jpeg (lossless) | 129 | 129 | 58.6 | 2.1 |
-| jpeg (rotated, rebuild) | 129 | 48 | 222 | 0.6 |
-| png (rebuild) | 37 | 36 | 447 | 0.1 |
-| gif (5 frames, lossless) | 4 | 4 | 2.1 | 2.1 |
-| webp (rebuild) | 15 | 15 | 1269 | 0.0 |
-| tiff (surgery) | 24576 | 24576 | 31.3 | **767** |
+| jpeg (lossless) | 129 | 129 | 36.5 | 3.4 |
+| jpeg (rotated, rebuild) | 129 | 48 | 238 | 0.5 |
+| png (rebuild) | 37 | 36 | 479 | 0.1 |
+| gif (5 frames, lossless) | 4 | 4 | 1.7 | 2.5 |
+| webp (rebuild) | 15 | 15 | 1467 | 0.0 |
+| tiff (surgery) | 24576 | 24576 | 38.9 | **617** |
 
 Read it right: the lossless paths (JPEG markers, GIF bytes, TIFF surgery) cost almost nothing; the rebuild paths pay the encode tax, and `webp` at method 6 is the tax man. That's the price of a clean file, and it's why the lossless paths exist. Your numbers will differ — that's physics, not a feature.
 
