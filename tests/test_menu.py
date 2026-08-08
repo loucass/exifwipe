@@ -7,7 +7,7 @@ from helpers import assert_jpeg_clean, jpeg_with_exif
 
 def _session(answers):
     it = iter(answers)
-    exifwipe.prompt_input = lambda label: next(it)
+    exifwipe._menu.prompt_input = lambda label: next(it)
     exifwipe.run_interactive_menu()
 
 

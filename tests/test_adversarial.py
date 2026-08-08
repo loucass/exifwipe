@@ -103,9 +103,9 @@ def test_jpeg_final_check_rewipes_dirty_stream(tmp_path):
     assert out == src.read_bytes() or exifwipe._jpeg_metadata_segments(out) == []
 
 
-def test_jpeg_final_check_works_without_piexif(monkeypatch, tmp_path):
-    # the old net leaned on piexif.remove(bytes) which raises on 1.1.3
-    monkeypatch.setattr(exifwipe, "piexif", None)
+def test_jpeg_final_check_works_without_piexif(tmp_path):
+    # no longer leans on piexif.remove() (which raises on 1.1.3 bytes input) —
+    # final check is a pure segment scan + lossless re-strip
     src = jpeg_with_exif(tmp_path / "d.jpg")
     out = exifwipe._jpeg_final_check(src.read_bytes())
     assert exifwipe._jpeg_metadata_segments(out) == []
@@ -113,7 +113,7 @@ def test_jpeg_final_check_works_without_piexif(monkeypatch, tmp_path):
 
 def test_jpeg_final_check_raises_loudly_when_rewipe_impossible(monkeypatch, tmp_path):
     src = jpeg_with_exif(tmp_path / "d.jpg")
-    monkeypatch.setattr(exifwipe, "_strip_jpeg_lossless", lambda *a, **k: None)
+    monkeypatch.setattr(exifwipe._jpeg, "_strip_jpeg_lossless", lambda *a, **k: None)
     with pytest.raises(RuntimeError):
         exifwipe._jpeg_final_check(src.read_bytes())
 
