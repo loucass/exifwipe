@@ -45,3 +45,7 @@ from _cli import build_parser, main
 from _config import __version__, __author__, __github__, __license__
 from _driver import pillow_heif
 from _cli import piexif
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
