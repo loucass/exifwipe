@@ -16,7 +16,7 @@ from lib._config import RAW_FORMATS
 from lib._driver import _sniff_format
 from lib._heif import _heif_exif_payload_present, _heif_metadata_extents
 from lib._jpeg import _jpeg_metadata_segments, _split_jpeg_frames
-from lib._tiff import _tiff_find_identifying, _tiff_parse_header
+from lib._tiff import _TIFF_IDENTIFYING, _tiff_find_identifying, _tiff_parse_header
 
 try:
     import piexif
@@ -28,17 +28,34 @@ _STRUCTURAL_KEYS = {
     "FileModifyDate", "FileAccessDate", "FileInodeChangeDate", "FilePermissions",
     "FileType", "FileTypeExtension", "MIMEType", "ImageWidth", "ImageHeight",
     "BitDepth", "ColorType", "EncodingProcess", "Megapixels", "ImageSize",
+    # DNG/RAW structural tags that MUST survive a strip for the file to
+    # remain a valid DNG/RAW — presence alone is not a leak.
+    "DNGVersion", "DNGBackwardVersion",
+    "BitsPerSample", "Compression", "PhotometricInterpretation",
+    "StripOffsets", "StripByteCounts", "TileOffsets", "TileByteCounts",
+    "RowsPerStrip", "SamplesPerPixel", "SampleFormat", "PlanarConfiguration",
+    "Predictor", "FillOrder",
+    # RAF fixed-header fields (cannot be blanked without breaking the file)
+    "RAFCompression",
 }
 
 
-_STRUCTURAL_GROUPS = {"JFIF", "ICC_Profile", "Composite", "ExifTool", "File"}
+_STRUCTURAL_GROUPS = {"JFIF", "ICC_Profile", "Composite", "ExifTool", "File",
+                      # ISO-BMFF/HEIF container structure and PDF file-level
+                      # structure — real metadata in these files lives in
+                      # EXIF/XMP payloads, which show up in their own groups.
+                      "QuickTime", "Meta", "PDF"}
 
 
 def _parse_exiftool_json(text: str) -> list:
     """Turn `exiftool -j -a -G1 FILE` output into a list of leaked tag names.
 
-    Keys that are structural (file size, dimensions, JFIF, ICC...) are
-    ignored; everything else is a leak. Returns [] on unparseable output.
+    Presence is NOT a leak: exifwipe strips by blanking values (all-spaces
+    / NULs) while keeping required structure, so a tag exiftool reports as
+    present-but-blank is clean. Binary values come back as a placeholder
+    that hides content — for tags the own byte parser judges by content
+    (make/model/makernote/...), defer to it instead. Returns [] on
+    unparseable output.
     """
     import json
     try:
@@ -48,13 +65,19 @@ def _parse_exiftool_json(text: str) -> list:
     if not isinstance(data, list) or not data:
         return []
     obj = data[0] if isinstance(data[0], dict) else {}
+    identifying_names = {v for v in _TIFF_IDENTIFYING.values()}
     leaks = []
-    for key in obj:
+    for key, val in obj.items():
         parts = key.split(":")
         group = parts[0] if len(parts) > 1 else ""
         tag = parts[-1]
         if tag in _STRUCTURAL_KEYS or group in _STRUCTURAL_GROUPS:
             continue
+        if val is None or (isinstance(val, str) and not val.strip()):
+            continue  # present but blanked -> clean
+        if (isinstance(val, str) and val.startswith("(Binary data ")
+                and tag in identifying_names):
+            continue  # content hidden by placeholder; byte parser judges
         leaks.append(key)
     return leaks
 
@@ -205,15 +228,15 @@ def _verify_bytes(path: Path, fmt: str) -> list:
 
 
 def verify_clean(path: Path) -> tuple[bool, list]:
-    """Return (clean, list-of-leaks). exiftool when installed, else the
-    per-format byte parsers."""
+    """Return (clean, list-of-leaks). exiftool is a REFEREE: its leaks are
+    UNIONED with the per-format byte parsers, so each side catches what the
+    other misses. exiftool unavailable -> byte parsers only."""
     fmt = _sniff_format(path) if path.is_file() else None
     if fmt is None:
         return True, []
-    leaks = _verify_with_exiftool(path)
-    if leaks is not None:
-        return (not leaks, leaks)
-    leaks = _verify_bytes(path, fmt)
+    own = _verify_bytes(path, fmt)
+    referee = _verify_with_exiftool(path)
+    leaks = own + [l for l in (referee or []) if l not in own]
     return (not leaks, leaks)
 
 
