@@ -4,7 +4,7 @@ Make ExifTool return blank on any image you're about to post.
 
 Photos carry hidden data. GPS coordinates, camera model, software versions, and the date are stored inside the file itself, invisible in the viewer but readable by anyone. `exifwipe` removes that data, then checks its own work to make sure nothing survived.
 
-The rule is simple: **if the format lets us delete metadata without touching the pixels, we don't touch the pixels.** JPEG markers get rewritten in place. RAW files are never "rebuilt" — you can't re-encode a raw sensor dump, and any tool that claims to is either lying or ruining your file.
+The rule is simple: **for lossless formats, the pixels are never touched.** JPEG markers get rewritten in place, GIF bytes are rewritten, and RAW/HEIC/AVIF files get metadata tables surgically removed — the pixels stay **byte-identical**, and the tool proves it. The only time pixels are re-encoded is when physics demands it (a JPEG that needs rotating, PNG/WebP rebuilds, and other lossy paths) — and the docs say so, per format, below.
 
 ## Install
 
@@ -74,7 +74,7 @@ removes all of this, including every copy the camera stashed in the file.
 | PNG | fresh frame rebuild, empty metadata | clean |
 | APNG | lossless chunk strip | clean; animation + pixels unchanged |
 | GIF | lossless in-place rewrite | clean; frames/palette/loop exact |
-| WebP | rebuild; lossless stays lossless | clean; animation kept |
+| WebP | lossless-in → lossless-out (byte-identical); lossy-in → clean re-encode | clean; animation kept |
 | TIFF / DNG / CR2 / NEF / ARW / ORF / RW2 / PEF / SRW | lossless IFD surgery | clean; sensor data byte-identical, never rebuilt |
 | BMP | pixel rebuild | clean |
 | HEIC / AVIF | lossless ISO-BMFF surgery | clean; pixels byte-identical |
@@ -84,6 +84,10 @@ removes all of this, including every copy the camera stashed in the file.
 The tool keeps structural bytes on purpose (the JFIF header, dimensions, and
 ICC profile only when asked) — files need those to display, and they're not
 secret.
+
+In the table, "byte-identical" is only ever claimed for lossless paths.
+Anything else means the pixels were rebuilt clean — not byte-identical, but
+metadata-free.
 
 ## How it works
 
