@@ -7,7 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Optional
 
-__version__ = "1.3.0"
+__version__ = "1.1.0"
 
 
 __author__ = "loucas"

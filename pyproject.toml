@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "exifwipe"
-version = "1.3.0"
+version = "1.1.0"
 description = "Strip EXIF, GPS, XMP, MakerNotes, HEIC/AVIF EXIF and DNG/RAW metadata from images/PDFs so exiftool returns blank — losslessly where physics allows."
 readme = "README.md"
 requires-python = ">=3.9"
