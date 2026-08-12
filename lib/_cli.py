@@ -10,12 +10,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from _color import c_err, c_ok, c_warn, set_color
-from _config import DEFAULT_MAX_PIXELS, IMAGE_FORMATS, RAW_FORMATS, R_ERR, R_OK, __version__
-from _driver import _sniff_format, handle_one, iter_inputs
-from _inspect import exiftool_hint, inspect_image
-from _menu import run_interactive_menu
-from _verify import print_formats_matrix, verify_clean
+from lib._color import c_err, c_ok, c_warn, set_color
+from lib._config import DEFAULT_MAX_PIXELS, IMAGE_FORMATS, RAW_FORMATS, R_ERR, R_OK, __version__
+from lib._driver import _sniff_format, handle_one, iter_inputs
+from lib._inspect import exiftool_hint, inspect_image
+from lib._menu import run_interactive_menu
+from lib._verify import print_formats_matrix, verify_clean
 
 try:
     import piexif

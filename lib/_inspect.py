@@ -8,8 +8,8 @@ import sys
 from pathlib import Path
 from PIL import Image
 
-from _color import c_dim, c_head, c_info, c_mag, c_warn
-from _config import DEFAULT_MAX_PIXELS
+from lib._color import c_dim, c_head, c_info, c_mag, c_warn
+from lib._config import DEFAULT_MAX_PIXELS
 
 def inspect_image(path: Path, max_pixels: Optional[int] = None) -> None:
     """Print the metadata fields ExifTool would surface on this image."""

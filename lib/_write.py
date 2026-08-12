@@ -9,8 +9,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from _color import c_dim, c_head, c_ok, c_warn
-from _config import _SYSTEM_DIRS
+from lib._color import c_dim, c_head, c_ok, c_warn
+from lib._config import _SYSTEM_DIRS
 
 
 def _refuse_system_target(path: Path) -> None:

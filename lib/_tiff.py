@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from _config import _MAKERNOTE_VENDORS
+from lib._config import _MAKERNOTE_VENDORS
 
 _TIFF_IDENTIFYING = {
     0x010E: "ImageDescription", 0x010F: "Make", 0x0110: "Model",

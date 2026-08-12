@@ -8,9 +8,9 @@ import argparse
 import sys
 from pathlib import Path
 
-from _color import c_blue, c_dim, c_err, c_head, c_info, c_mag, c_ok, c_warn
-from _config import R_ERR, R_OK, _MENU_ART
-from _driver import handle_one, iter_inputs
+from lib._color import c_blue, c_dim, c_err, c_head, c_info, c_mag, c_ok, c_warn
+from lib._config import R_ERR, R_OK, _MENU_ART
+from lib._driver import handle_one, iter_inputs
 
 def print_top_banner() -> None:
     for line in _MENU_ART.splitlines():

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from PIL import Image
 
-from _color import c_err, c_warn
+from lib._color import c_err, c_warn
 
 def strip_pdf_bytes(path: Path) -> bytes:
     """Strip /DocInfo + XMP from PDF via pikepdf.

@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from _config import RAW_EXTENSIONS, _PNG_SIG, _RAF_MAGIC
-from _tiff import _tiff_has_tag, _tiff_vendor_from_makernote
+from lib._config import RAW_EXTENSIONS, _PNG_SIG, _RAF_MAGIC
+from lib._tiff import _tiff_has_tag, _tiff_vendor_from_makernote
 
 
 def _sniff_bytes(data: bytes) -> Optional[str]:

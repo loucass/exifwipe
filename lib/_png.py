@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 
-from _config import _PNG_SIG
+from lib._config import _PNG_SIG
 
 def _png_is_animated(data: bytes) -> bool:
     """True when the PNG stream carries an acTL (animation control) chunk."""

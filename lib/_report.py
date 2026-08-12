@@ -7,11 +7,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from _color import c_dim, c_head, c_ok, c_warn
-from _config import RAW_FORMATS
-from _heif import _heif_metadata_extents
-from _jpeg import _jpeg_metadata_segments
-from _tiff import _TIFF_IDENTIFYING, _tiff_find_identifying, _tiff_inventory
+from lib._color import c_dim, c_head, c_ok, c_warn
+from lib._config import RAW_FORMATS
+from lib._heif import _heif_metadata_extents
+from lib._jpeg import _jpeg_metadata_segments
+from lib._tiff import _TIFF_IDENTIFYING, _tiff_find_identifying, _tiff_inventory
 
 try:
     import piexif

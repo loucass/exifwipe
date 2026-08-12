@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 
-from _config import _HEIF_META_TYPES
+from lib._config import _HEIF_META_TYPES
 
 def _heif_box_children(data: bytes, start: int, end: int):
     """Yield (box_pos, size, type, payload_pos) for boxes in [start, end),

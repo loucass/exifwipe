@@ -11,21 +11,21 @@ from pathlib import Path
 from typing import Iterable, Optional
 from PIL import Image
 
-from _color import c_dim, c_err, c_head, c_info, c_ok, c_warn
-from _config import DEFAULT_MAX_PIXELS, IMAGE_FORMATS, RAW_FORMATS, R_ERR, R_OK, R_SKIP
-from _gif import _strip_gif_lossless
-from _heif import _strip_heif_lossless
-from _inspect import inspect_image
-from _jpeg import _jpeg_final_check, _jpeg_orientation_from_bytes, _jpeg_sof_size, _rebuild_jpeg_from_img, _strip_jpeg_lossless, _strip_mpo_rotated_first
-from _pdf import strip_pdf_bytes
-from _pixels import _apply_orientation, _perturb_image, _perturb_seed, _rebuild_frame, _strip_multiframe
-from _png import _png_is_animated, _strip_png_lossless
-from _raf import _strip_raf_lossless
-from _report import _inventory_metadata, _print_report
-from _sniff import _sniff_bytes, _sniff_format
-from _tiff import _is_tiff_family, _tiff_strip_lossless
-from _webp import _webp_is_lossless
-from _write import _atomic_write_bytes, write_output
+from lib._color import c_dim, c_err, c_head, c_info, c_ok, c_warn
+from lib._config import DEFAULT_MAX_PIXELS, IMAGE_FORMATS, RAW_FORMATS, R_ERR, R_OK, R_SKIP
+from lib._gif import _strip_gif_lossless
+from lib._heif import _strip_heif_lossless
+from lib._inspect import inspect_image
+from lib._jpeg import _jpeg_final_check, _jpeg_orientation_from_bytes, _jpeg_sof_size, _rebuild_jpeg_from_img, _strip_jpeg_lossless, _strip_mpo_rotated_first
+from lib._pdf import strip_pdf_bytes
+from lib._pixels import _apply_orientation, _perturb_image, _perturb_seed, _rebuild_frame, _strip_multiframe
+from lib._png import _png_is_animated, _strip_png_lossless
+from lib._raf import _strip_raf_lossless
+from lib._report import _inventory_metadata, _print_report
+from lib._sniff import _sniff_bytes, _sniff_format
+from lib._tiff import _is_tiff_family, _tiff_strip_lossless
+from lib._webp import _webp_is_lossless
+from lib._write import _atomic_write_bytes, write_output
 
 try:
     import pillow_heif

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 
 
-from _config import _RAF_MAGIC
-from _jpeg import _jpeg_metadata_segments, _strip_jpeg_lossless
-from _tiff import _tiff_find_identifying, _tiff_parse_header, _tiff_strip_lossless
+from lib._config import _RAF_MAGIC
+from lib._jpeg import _jpeg_metadata_segments, _strip_jpeg_lossless
+from lib._tiff import _tiff_find_identifying, _tiff_parse_header, _tiff_strip_lossless
 
 def _strip_raf_lossless(data: bytes, keep_icc: bool = False):
     """Lossless wipe of a Fuji RAF container: blank the serial + camera

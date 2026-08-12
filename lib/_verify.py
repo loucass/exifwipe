@@ -11,12 +11,12 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from _color import c_dim, c_head, c_info
-from _config import RAW_FORMATS
-from _driver import _sniff_format
-from _heif import _heif_exif_payload_present, _heif_metadata_extents
-from _jpeg import _jpeg_metadata_segments, _split_jpeg_frames
-from _tiff import _tiff_find_identifying, _tiff_parse_header
+from lib._color import c_dim, c_head, c_info
+from lib._config import RAW_FORMATS
+from lib._driver import _sniff_format
+from lib._heif import _heif_exif_payload_present, _heif_metadata_extents
+from lib._jpeg import _jpeg_metadata_segments, _split_jpeg_frames
+from lib._tiff import _tiff_find_identifying, _tiff_parse_header
 
 try:
     import piexif

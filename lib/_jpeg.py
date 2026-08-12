@@ -8,7 +8,7 @@ import io
 from typing import Optional
 from PIL import Image
 
-from _pixels import _apply_orientation, _perturb_image, _rebuild_frame
+from lib._pixels import _apply_orientation, _perturb_image, _rebuild_frame
 
 def _jpeg_orientation_from_bytes(data: bytes) -> Optional[int]:
     """EXIF Orientation (0x0112, IFD0) read straight off the APP1 segment
