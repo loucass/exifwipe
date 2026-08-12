@@ -5,6 +5,7 @@ from __future__ import annotations
 
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 from typing import Optional
@@ -214,7 +215,7 @@ def main(argv: Optional[list] = None) -> int:
                   file=sys.stderr)
         else:
             print(f"  {c_ok('VERIFY OK:')} no metadata on any clean file.")
-    if piexif is None:
+    if piexif is None and args.verify and shutil.which("exiftool") is None:
         print("tip: install piexif for JPEG round-trip verify:  pip3 install piexif",
               file=sys.stderr)
     return 0 if (n_err == 0 and (not args.verify or not leaks)) else 3
