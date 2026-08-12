@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Optional
 from PIL import Image
 
 from lib._color import c_dim, c_head, c_info, c_mag, c_warn
@@ -21,8 +22,9 @@ def inspect_image(path: Path, max_pixels: Optional[int] = None) -> None:
         print(f"  {c_info('format')}={img.format}  {c_info('mode')}={img.mode}  "
               f"{c_info('size')}={w}x{h}")
         if max_pixels and w * h > max_pixels:
-            print(f"  {c_warn(f'too large to inspect in detail '
-                              f'({w*h:,}px > {max_pixels:,} limit)')}")
+            detail = "too large to inspect in detail " \
+                     f"({w * h:,}px > {max_pixels:,} limit)"
+            print(f"  {c_warn(detail)}")
             return
 
         exif = img.getexif() if hasattr(img, "getexif") else None
