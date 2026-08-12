@@ -39,7 +39,9 @@ from _heif import _heif_box_children, _heif_iloc_items, _heif_item_types, _heif_
 from _raf import _strip_raf_lossless
 from _pdf import strip_pdf_bytes
 from _report import _inventory_metadata, _print_report
-from _driver import strip_image_bytes, _refuse_system_target, _atomic_write_bytes, write_output, _sniff_bytes, _sniff_format, handle_one, iter_inputs
+from _driver import strip_image_bytes, handle_one, iter_inputs
+from _sniff import _sniff_bytes, _sniff_format
+from _write import _atomic_write_bytes, write_output, _refuse_system_target
 from _menu import print_top_banner, prompt_input, _clear_screen, _pause_if_tty, _run_menu_action, _state, menu_choose, run_interactive_menu
 from _cli import build_parser, main
 from _config import __version__, __author__, __github__, __license__

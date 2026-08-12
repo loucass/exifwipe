@@ -34,7 +34,8 @@ exifwipe = "exifwipe:main"
 [tool.setuptools]
 py-modules = ["exifwipe", "_color", "_config", "_inspect", "_verify",
               "_tiff", "_pixels", "_jpeg", "_gif", "_png", "_webp",
-              "_heif", "_raf", "_pdf", "_report", "_driver", "_menu", "_cli"]
+              "_heif", "_raf", "_pdf", "_report", "_driver", "_sniff", "_write",
+              "_menu", "_cli"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

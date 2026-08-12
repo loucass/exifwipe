@@ -6,16 +6,13 @@ from __future__ import annotations
 
 import argparse
 import io
-import os
-import secrets
-import stat
 import sys
 from pathlib import Path
 from typing import Iterable, Optional
 from PIL import Image
 
 from _color import c_dim, c_err, c_head, c_info, c_ok, c_warn
-from _config import DEFAULT_MAX_PIXELS, IMAGE_FORMATS, RAW_EXTENSIONS, RAW_FORMATS, R_ERR, R_OK, R_SKIP, _PNG_SIG, _RAF_MAGIC, _SYSTEM_DIRS
+from _config import DEFAULT_MAX_PIXELS, IMAGE_FORMATS, RAW_FORMATS, R_ERR, R_OK, R_SKIP
 from _gif import _strip_gif_lossless
 from _heif import _strip_heif_lossless
 from _inspect import inspect_image
@@ -25,8 +22,10 @@ from _pixels import _apply_orientation, _perturb_image, _perturb_seed, _rebuild_
 from _png import _png_is_animated, _strip_png_lossless
 from _raf import _strip_raf_lossless
 from _report import _inventory_metadata, _print_report
-from _tiff import _is_tiff_family, _tiff_has_tag, _tiff_strip_lossless, _tiff_vendor_from_makernote
+from _sniff import _sniff_bytes, _sniff_format
+from _tiff import _is_tiff_family, _tiff_strip_lossless
 from _webp import _webp_is_lossless
+from _write import _atomic_write_bytes, write_output
 
 try:
     import pillow_heif
@@ -302,176 +301,14 @@ def strip_image_bytes(path: Path, keep_icc: bool = False,
     return cleaned, fmt_out.lower()
 
 
-def _refuse_system_target(path: Path) -> None:
-    """Refuse to write into top-level system directories so a stray -o
-    can't drop an image into /etc or /usr. /tmp, /var, /home and
-    /run/media (USB mounts) are fine."""
-    try:
-        parts = path.resolve().parts
-    except Exception:
-        return
-    if len(parts) > 1 and parts[1] in _SYSTEM_DIRS:
-        # /run/media/<user>/... is a legitimate removable-mount target
-        if parts[1] == "run" and len(parts) > 2 and parts[2] == "media":
-            return
-        raise RuntimeError(
-            f"refusing to write into system directory '/{parts[1]}' ({path}); "
-            "use a user-writable location"
-        )
 
 
-def _atomic_write_bytes(path: Path, cleaned: bytes, st) -> None:
-    """Write `cleaned` to `path` atomically via a private temp file that
-    only we created (O_EXCL — no attacker can pre-plant a symlink at a
-    predictable name), fsync it, then rename over the original.
-
-    A symlink is resolved FIRST so the write lands on the target — the
-    link itself is preserved (the old behavior replaced the symlink with
-    a regular file AND left the target dirty, which was both silent and
-    a leak).
-
-    Mode and mtime of the original are preserved on the new inode so a
-    0600 private photo stays 0600; setuid/setgid/sticky bits are NOT
-    carried over (masked with 0o7777).
-    """
-    if path.is_symlink():
-        path = path.resolve()
-    import secrets
-    for _ in range(10):
-        tmp = path.with_name(f".{path.name}.exifwipe_tmp_{secrets.token_hex(8)}")
-        try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            continue            # collision — try another random name
-        except OSError as e:
-            raise OSError(f"cannot create temp file for {path.name}: {e}") from e
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(cleaned)
-                f.flush()
-                os.fsync(f.fileno())
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        # preserve the permission bits only — setuid/setgid/sticky are
-        # dropped (carrying them over would be sloppy and exploitable)
-        os.chmod(tmp, stat.S_IMODE(st.st_mode) & 0o777)
-        os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
-        os.replace(tmp, path)
-        return
-    raise OSError(f"could not reserve a unique temp name for {path.name}")
 
 
-def write_output(src: Path, out: Optional[Path], cleaned: bytes,
-                 no_clobber: bool = False) -> None:
-    """Either overwrite src in place, or write to `out` (file or dir)."""
-    if out is None:
-        _refuse_system_target(src)
-        target = src
-        if src.is_symlink():
-            resolved = src.resolve()
-            if not resolved.is_file():
-                raise OSError(f"{src} is a dangling symlink — nothing to strip")
-            target = resolved
-            print(f"  {c_warn('[LINK]')} {c_head(str(src))} -> "
-                  f"{c_head(str(target))} {c_dim('(stripping target in place)')}")
-        st = target.stat()
-        if st.st_nlink > 1:
-            print(f"  {c_warn('[WARN]')} {c_head(str(target))} has "
-                  f"{st.st_nlink} hard links — the other names still point "
-                  "at the pre-wipe data", file=sys.stderr)
-        _atomic_write_bytes(target, cleaned, st)
-        print(f"  {c_ok('[STRIPPED]')} {c_head(str(src))}")
-    else:
-        # if user passed a folder or a path-without-suffix, drop src inside
-        if out.is_dir() or (not out.suffix and not out.exists()):
-            out = out / src.name
-        _refuse_system_target(out)
-        if no_clobber and out.exists():
-            raise FileExistsError(f"{out} already exists (--no-clobber)")
-        if out.exists() and out.resolve() != src.resolve():
-            print(f"  {c_warn('[clobber]')} overwriting existing "
-                  f"{c_head(str(out))}", file=sys.stderr)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(cleaned)
-        print(f"  {c_ok('[STRIPPED]')} {c_head(str(src))}  {c_dim('->')}  "
-              f"{c_head(str(out))}")
 
 
-def _sniff_bytes(data: bytes) -> Optional[str]:
-    """Format from magic bytes only (no extension hints). Used by the
-    strip path and the report inventory; the CR2 magic (0x0201 in the
-    extended header) is the only RAW family detectable from bytes alone."""
-    if data[:2] == b"\xff\xd8":
-        return "jpeg"
-    if data[:8] == _PNG_SIG:
-        return "png"
-    if data[:6] in (b"GIF87a", b"GIF89a"):
-        return "gif"
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "webp"
-    if data[:16] == _RAF_MAGIC:
-        return "raf"          # Fuji — NOT a TIFF container
-    if data[:4] in (b"II*\x00", b"MM\x00*"):
-        # CR2: 16-byte header (IFD0 at 0x10) + CR2 magic 0x0201 at offset 8
-        if (data[:8] == b"II*\x00\x10\x00\x00\x00"
-                and data[8:10] == b"\x01\x02"):
-            return "cr2"
-        return "tiff"
-    if data[:2] == b"BM":
-        return "bmp"
-    if data[:4] == b"%PDF":
-        return "pdf"
-    if data[4:8] == b"ftyp":
-        brand = data[8:12]
-        # HEIF/AVIF share the ISO BMFF container; disambiguate by brand
-        if brand in (b"avif", b"avis"):
-            return "avif"
-        if brand in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1",
-                     b"heif", b"heim"):
-            return "heif"
-    return None
 
 
-def _sniff_format(path: Path) -> Optional[str]:
-    """Detect a file's real format from its magic bytes, not its name.
-    Returns a normalized format name ('jpeg', 'png', 'gif', 'tiff',
-    'webp', 'bmp', 'heif', 'avif', 'raf', 'pdf') or None if unrecognized.
-
-    TIFF-family files that aren't obviously CR2/DNG-by-extension get a
-    deep read: DNG by its DNGVersion tag, then RAW family by MakerNote
-    prefix — so an extensionless NEF or a .tiff that's really an ARW is
-    handled as the RAW it actually is."""
-    try:
-        head = path.open("rb").read(16)
-    except OSError:
-        return None
-    fmt = _sniff_bytes(head)
-    if fmt != "tiff":
-        return fmt
-    ext = path.suffix.lower()
-    if ext == ".cr2":
-        return "cr2"
-    if ext == ".dng":
-        return "dng"
-    if ext in RAW_EXTENSIONS:
-        return ext.lstrip(".")
-    # anything else TIFF-family (extensionless, .tiff, or a .bin that's
-    # really a NEF): the extension is only a hint — the DNGVersion tag
-    # and the MakerNote are authoritative
-    try:
-        more = path.open("rb").read(1 << 20)
-    except OSError:
-        more = b""
-    if not more:
-        return "tiff"
-    if _tiff_has_tag(more, 0xC612):
-        return "dng"
-    vend = _tiff_vendor_from_makernote(more)
-    return vend if vend else "tiff"
 
 
 def handle_one(path: Path, args: argparse.Namespace) -> int:

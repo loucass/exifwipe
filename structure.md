@@ -22,8 +22,10 @@ exifwipe/
 ├── _raf.py              # Fuji RAF surgery (borrows TIFF + JPEG pieces)
 ├── _pdf.py              # PDF strip (pikepdf optional, local import)
 ├── _report.py           # report metadata inventory (optional piexif)
-├── _driver.py           # handle_one, strip_image_bytes dispatcher, sniffing,
-│                         # atomic writes, iter_inputs (pillow-heif optional)
+├── _driver.py           # handle_one, strip_image_bytes dispatcher,
+│                         # iter_inputs (pillow-heif optional)
+├── _sniff.py            # format detection from magic bytes
+├── _write.py            # atomic writes, output paths, system-dir guard
 ├── _menu.py             # interactive menu + prompt_input
 ├── _cli.py              # argparse, main(), formats matrix (optional piexif)
 ├── tests/               # 131 tests, 20 files
