@@ -300,10 +300,11 @@ def _walk_tiff(pager, data: bytes, fmt: str) -> None:
             totals["entries"] += 1
             name = _tag_name(tag, label)
             flags = _anomalies(raw, typ, tag, label, name)
+            tinfo = _lcol(_TYPE_NAMES.get(typ, '?') + ':' + str(cnt),
+                          c_dim, 16)
             line = (f"{indent}  {_lcol(name, c_info, 24)} "
                     f"{c_dim('0x%04X' % tag)} "
-                    f"{_lcol(_TYPE_NAMES.get(typ, '?') + ':' + str(cnt),
-                             c_dim, 16)}"
+                    f"{tinfo}"
                     f" = {c_warn(_format_value(raw, typ, tag, label))}")
             if flags:
                 line += "  " + c_danger("[danger] ") + "; ".join(flags)
