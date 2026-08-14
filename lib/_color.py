@@ -49,6 +49,9 @@ def c_err(t):   return _c(t, "31")                     # red
 def c_danger(t): return _c(t, "1;31")                  # bold red
 
 
+def c_orange(t): return _c(t, "38;5;208")              # orange (256-color)
+
+
 def c_warn(t):  return _c(t, "33")                     # yellow
 
 

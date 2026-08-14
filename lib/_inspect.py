@@ -17,7 +17,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from lib._color import c_danger, c_dim, c_head, c_err, c_info, c_mag, c_ok, c_warn
+from lib._color import (c_danger, c_dim, c_head, c_err, c_info, c_mag,
+                       c_ok, c_orange, c_warn)
 from lib._config import DEFAULT_MAX_PIXELS, RAW_FORMATS
 from lib._heif import _heif_metadata_extents
 from lib._jpeg import _jpeg_metadata_segments
@@ -135,6 +136,20 @@ class _Pager:
             return False
         self.count = 0
         return ans.strip().lower() not in ("q", "quit")
+
+
+def _unfamiliar(msg: str) -> str:
+    """The anomaly badge: red [unfamiliar] tag + orange explanation."""
+    return c_err("[unfamiliar]") + " " + c_orange(msg)
+
+
+def _lcol(text: str, color, width: int) -> str:
+    """Pad plain text to width, THEN colorize.
+
+    Coloring first would let the invisible ANSI escape codes count
+    toward the width, which collapses column alignment on a TTY.
+    """
+    return color(text.ljust(width))
 
 
 def _size_str(n: int) -> str:
@@ -285,9 +300,10 @@ def _walk_tiff(pager, data: bytes, fmt: str) -> None:
             totals["entries"] += 1
             name = _tag_name(tag, label)
             flags = _anomalies(raw, typ, tag, label, name)
-            line = (f"{indent}  {c_info(name):24s} "
+            line = (f"{indent}  {_lcol(name, c_info, 24)} "
                     f"{c_dim('0x%04X' % tag)} "
-                    f"{c_dim(_TYPE_NAMES.get(typ, '?') + ':' + str(cnt)):16s}"
+                    f"{_lcol(_TYPE_NAMES.get(typ, '?') + ':' + str(cnt),
+                             c_dim, 16)}"
                     f" = {c_warn(_format_value(raw, typ, tag, label))}")
             if flags:
                 line += "  " + c_danger("[danger] ") + "; ".join(flags)
@@ -346,8 +362,8 @@ def _inspect_jpeg(pager, data: bytes) -> None:
                         if (section == "GPS" and tag in (0x0002, 0x0004)
                                 and len(val) == 3):
                             frac = []
-                            for n, d in val:
-                                frac.append(n / d if d else 0)
+                            for num, den in val:
+                                frac.append(num / den if den else 0)
                             deg = frac[0] + frac[1] / 60 + frac[2] / 3600
                             ref = ""
                             if (tag == 0x0002
@@ -361,7 +377,7 @@ def _inspect_jpeg(pager, data: bytes) -> None:
                             disp = str(val)
                     raw = val if isinstance(val, bytes) else b""
                     flags = _anomalies(raw, 7, tag, label, tagname)
-                    line = (f"    {c_info(str(tagname)):24s} "
+                    line = (f"    {_lcol(str(tagname), c_info, 24)} "
                             f"{c_dim('0x%04X' % tag)} = {c_warn(str(disp))}")
                     if flags:
                         line += "  " + c_danger("[danger] ") + "; ".join(flags)
@@ -375,8 +391,8 @@ def _inspect_jpeg(pager, data: bytes) -> None:
         pager.emit(c_dim("    JFIF marker present (structural)"))
     for nm in ("APP13:Photoshop", "ICC_PROFILE"):
         if nm == "ICC_PROFILE" and b"ICC_PROFILE\x00" in data:
-            pager.emit(c_err("  [unfamiliar] ICC profile present — color management, "
-                              "not metadata"))
+            pager.emit("  " + _unfamiliar("ICC profile present — color management, "
+                                           "not metadata"))
 
 
 def _inspect_png(pager, data: bytes) -> None:
@@ -392,18 +408,18 @@ def _inspect_png(pager, data: bytes) -> None:
         flag = ""
         if ctype in (b"tEXt", b"iTXt", b"zTXt"):
             kw = _decode_ascii(payload[:80].split(b"\x00")[0])
-            flag = c_err(f" [unfamiliar] text chunk keyword={kw!r}")
+            flag = " " + _unfamiliar(f"text chunk keyword={kw!r}")
         elif ctype in (b"eXIf", b"iCCP", b"pHYs", b"acTL", b"fcTL"):
             flag = c_warn(f" ({ctype.decode()} metadata/structure)")
         elif ctype == b"IEND":
             iend = True
         elif iend:
-            flag = c_err(" [unfamiliar] data after IEND")
-        pager.emit(f"    {c_info(ctype.decode('ascii', 'replace')):8s} "
-                   f"{c_dim(_size_str(clen)):10s} @ {pos}{flag}")
+            flag = " " + _unfamiliar("data after IEND")
+        pager.emit(f"    {_lcol(ctype.decode('ascii', 'replace'), c_info, 8)} "
+                   f"{_lcol(_size_str(clen), c_dim, 10)} @ {pos}{flag}")
         pos += 12 + clen
     if pos != n:
-        pager.emit(c_err(f"    [unfamiliar] {n - pos} trailing bytes after last chunk"))
+        pager.emit("    " + _unfamiliar(f"{n - pos} trailing bytes after last chunk"))
 
 
 def _inspect_webp(pager, data: bytes) -> None:
@@ -415,9 +431,9 @@ def _inspect_webp(pager, data: bytes) -> None:
             break
         flag = ""
         if tag in (b"EXIF", b"XMP ", b"ICCP"):
-            flag = c_err(" [unfamiliar] metadata chunk")
-        pager.emit(f"    {c_info(tag.decode('ascii', 'replace')):6s} "
-                   f"{c_dim(_size_str(size)):10s} @ {pos}{flag}")
+            flag = " " + _unfamiliar("metadata chunk")
+        pager.emit(f"    {_lcol(tag.decode('ascii', 'replace'), c_info, 6)} "
+                   f"{_lcol(_size_str(size), c_dim, 10)} @ {pos}{flag}")
         pos += 8 + size + (size & 1)
     if b"VP8X" in data[:20]:
         pager.emit(c_dim("    VP8X extended header (animation/canvas "
@@ -430,11 +446,11 @@ def _inspect_webp(pager, data: bytes) -> None:
 def _inspect_gif(pager, data: bytes) -> None:
     ncom = data.count(b"\x21\xfe")
     if ncom:
-        pager.emit(c_err(f"  [unfamiliar] {ncom} comment extension(s)"))
+        pager.emit("  " + _unfamiliar(f"{ncom} comment extension(s)"))
     else:
         pager.emit("  comment extensions: none")
     if b"XMP Data" in data:
-        pager.emit(c_err("  [unfamiliar] XMP application extension present"))
+        pager.emit("  " + _unfamiliar("XMP application extension present"))
     else:
         pager.emit("  XMP: none")
 
@@ -447,17 +463,17 @@ def _inspect_heif(pager, data: bytes) -> None:
     pager.emit(f"  ISO-BMFF metadata item extents: {len(ext)}")
     for s, e in ext:
         filled = any(data[s:e])
-        mark = c_err(" [unfamiliar] still populated") if filled else c_ok("blank")
+        mark = " " + _unfamiliar("still populated") if filled else c_ok("blank")
         pager.emit(f"    {s}..{e} ({_size_str(e - s)}) {mark}")
     if b"<x:xmpmeta" in data:
-        pager.emit(c_err("  [unfamiliar] XMP payload present"))
+        pager.emit("  " + _unfamiliar("XMP payload present"))
 
 
 def _inspect_raf(pager, data: bytes) -> None:
     zone = data[0x14:0x40] if len(data) >= 0x40 else b""
     if any(b not in (0, 32) for b in zone):
-        pager.emit(c_err("  [unfamiliar] header zone (serial/model/firmware) "
-                          "NOT blank"))
+        pager.emit("  " + _unfamiliar("header zone (serial/model/firmware) "
+                                       "NOT blank"))
     else:
         pager.emit("  header zone (serial/model/firmware): blank")
     jpos = int.from_bytes(data[0x54:0x58], "big") if len(data) >= 0x5c else 0
@@ -466,14 +482,14 @@ def _inspect_raf(pager, data: bytes) -> None:
         pager.emit(f"  embedded JPEG preview: {jpos}..{jpos + jlen} "
                    f"({_size_str(jlen)})")
         for nm in _jpeg_metadata_segments(data[jpos:jpos + jlen]):
-            pager.emit(c_err(f"    [unfamiliar] preview carries: {nm}"))
+            pager.emit("    " + _unfamiliar(f"preview carries: {nm}"))
     foff = int.from_bytes(data[0x64:0x68], "big") if len(data) >= 0x6c else 0
     flen = int.from_bytes(data[0x68:0x6c], "big") if len(data) >= 0x6c else 0
     if foff and flen and foff + flen <= len(data):
         region = data[foff:foff + flen]
         pager.emit(f"  FujiIFD block: {foff}..{foff + flen}")
         for nm in _tiff_find_identifying(region):
-            pager.emit(c_err(f"    [unfamiliar] FujiIFD carries: {nm}"))
+            pager.emit("    " + _unfamiliar(f"FujiIFD carries: {nm}"))
 
 
 def _inspect_pdf(pager, data: bytes) -> None:
@@ -532,8 +548,8 @@ def inspect_image(path: Path, max_pixels: Optional[int] = None,
         pager.emit(c_err(f"  [ERR] {e}"))
         return
     fmt = _sniff_format(path)
-    pager.emit(f"  {c_info('format')}={fmt or 'unknown'}  "
-               f"{c_dim(_size_str(len(data)))}")
+    pager.emit(f"  {c_info('format')}={fmt or 'unknown'}")
+    pager.emit(f"  {c_info('size')}={c_dim(_size_str(len(data)))}")
     if fmt is None:
         pager.emit(c_warn("    unrecognized file — nothing to show"))
         return
@@ -592,40 +608,52 @@ def inspect_image(path: Path, max_pixels: Optional[int] = None,
     except Exception:
         info = {}
     if info:
-        pager.emit(f"  {c_head('img.info keys:')} "
-                   f"{c_dim(str(list(info.keys())))}")
+        pager.emit(f"  {c_head('img.info:')}")
         for k, v in info.items():
-            disp, note = _img_info_value(k, v)
-            line = f"    {c_mag(repr(str(k))):24s} = {c_warn(disp)}"
-            if note:
-                line += c_dim("  " + note)
+            disp = _img_info_value(k, v)
+            sz = _img_info_size(v)
+            key = repr(str(k))
+            if sz is not None:
+                line = (f"    {_lcol(key, c_mag, 20)} "
+                        f"{_lcol('(' + _size_str(sz) + ')', c_dim, 9)} = "
+                        f"{c_warn(disp)}")
+            else:
+                line = f"    {_lcol(key, c_mag, 20)} = {c_warn(disp)}"
             pager.emit(line)
+
+
+def _img_info_size(v) -> Optional[int]:
+    """Byte size of an img.info value, or None when not meaningful."""
+    if isinstance(v, (bytes, bytearray)):
+        return len(v)
+    if isinstance(v, str):
+        return len(v.encode("utf-8", errors="replace"))
+    return None
 
 
 def _img_info_value(k, v):
     """Turn Pillow's img.info entries into something a human can read."""
     if k == "jfif" and isinstance(v, int):
         # 0x0101 = version 1.01 (major byte, minor byte)
-        return f"JFIF v{v >> 8}.{v & 0xFF:02d}", "container version header"
+        return f"JFIF v{v >> 8}.{v & 0xFF:02d}"
     if k == "jfif_version" and isinstance(v, tuple):
-        return ".".join(str(x) for x in v), "container version header"
+        return ".".join(str(x) for x in v)
     if k == "jfif_unit":
         return {0: "none (aspect only)", 1: "dots per inch",
-                2: "dots per cm"}.get(v, str(v)), "density unit"
+                2: "dots per cm"}.get(v, str(v))
     if k in ("jfif_density", "dpi") and isinstance(v, tuple):
-        return f"{v[0]}x{v[1]}", "pixel density"
+        return f"{v[0]:g}x{v[1]:g}"
     if k == "progressive":
-        return "yes" if v else "no", "interlaced encoding"
+        return "yes" if v else "no"
     if isinstance(v, (bytes, bytearray)):
         if k in ("exif", "xmp", "icc_profile"):
-            what = {"exif": "raw EXIF payload (decoded above)",
+            return {"exif": "raw EXIF payload (decoded above)",
                     "xmp": "XMP XML payload",
                     "icc_profile": "ICC color profile"}[k]
-            return _size_str(len(v)), what
-        return _size_str(len(v)), f"blob of {len(v)} bytes"
+        return "binary blob"
     if isinstance(v, str):
-        return repr(v[:80]) + ("..." if len(v) > 80 else ""), ""
-    return repr(v), ""
+        return repr(v[:80]) + ("..." if len(v) > 80 else "")
+    return repr(v)
 
 
 def exiftool_hint() -> str:
