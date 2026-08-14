@@ -51,10 +51,10 @@ def _pause_if_tty() -> None:
 def _run_menu_action(action: str, path: Path, keep_icc: bool, dry_run: bool) -> None:
     """Run one interactive operation against a path (reuses handle_one)."""
     ns = argparse.Namespace(output=None, keep_icc=keep_icc, dry_run=dry_run,
-                            inspect=False, verbose=False, max_pixels=None,
-                            no_clobber=False)
-    if action == "inspect":
-        ns.inspect = True
+                            inspect=action == "inspect", verbose=False,
+                            max_pixels=None, no_clobber=False, full=False,
+                            report=False, drop_orientation=False,
+                            perturb=None)
 
     targets = list(iter_inputs(path))
     if not targets:
@@ -81,41 +81,36 @@ def _state(val: bool) -> str:
     return c_ok("on") if val else c_err("off")
 
 
-def menu_choose(keep_icc: bool, dry_run: bool) -> str:
+def menu_choose(keep_icc: bool) -> str:
     print()
     print(c_head("  ▸ what do you want to do?"))
-    print(f"    {c_head('[1]')} strip one file")
-    print(f"    {c_head('[2]')} strip a whole folder (recursive)")
-    print(f"    {c_head('[3]')} inspect a file (see what ExifTool would surface)")
-    print(f"    {c_head('[4]')} dry-run a file or folder (no writes)")
-    print(f"    {c_head('[5]')} toggle: keep ICC profile    now: {c_mag('[ ' + _state(keep_icc) + ' ]')}")
-    print(f"    {c_head('[6]')} toggle: dry-run             now: {c_mag('[ ' + _state(dry_run) + ' ]')}")
+    print(f"    {c_head('[1]')} strip a file or folder (recursive)")
+    print(f"    {c_head('[2]')} inspect a file or folder (deep metadata dump)")
+    print(f"    {c_head('[3]')} dry-run a file or folder (no writes)")
+    print(f"    {c_head('[4]')} toggle: keep ICC profile    now: {c_mag('[ ' + _state(keep_icc) + ' ]')}")
     print(f"    {c_head('[q]')} quit")
     return prompt_input("choice")
 
 
 def run_interactive_menu() -> int:
-    keep_icc, dry_run = False, False
+    keep_icc = False
     while True:
         # clear + re-render every pass: the terminal never piles menus
         # on top of previous output
         _clear_screen()
         print_top_banner()
-        choice = menu_choose(keep_icc, dry_run).strip().lower()
+        choice = menu_choose(keep_icc).strip().lower()
         if choice in ("q", "quit", "exit", ""):
             # clear the TUI off the screen, then sign off
             _clear_screen()
             print(c_blue("    0x-goodbye — metadata wiped, pixels clean."))
             print(c_dim("    now go post it before someone else does."))
             return 0
-        if choice == "5":
+        if choice == "4":
             keep_icc = not keep_icc
             continue
-        if choice == "6":
-            dry_run = not dry_run
-            continue
-        if choice not in ("1", "2", "3", "4"):
-            print(c_warn("    pick 1-6 or q."))
+        if choice not in ("1", "2", "3"):
+            print(c_warn("    pick 1-4 or q."))
             _pause_if_tty()
             continue
         raw = prompt_input("Target path").strip()
@@ -126,8 +121,8 @@ def run_interactive_menu() -> int:
             print(c_err(f"    not found: {path}"))
             _pause_if_tty()
             continue
-        action = {"1": "strip", "2": "strip", "3": "inspect", "4": "dry"}[choice]
-        # "4" is a one-shot dry-run: it must NOT flip the persistent toggle.
-        _run_menu_action(action, path, keep_icc, dry_run or action == "dry")
+        action = {"1": "strip", "2": "inspect", "3": "dry"}[choice]
+        # "3" is a one-shot dry-run: it must NOT flip any persistent toggle.
+        _run_menu_action(action, path, keep_icc, dry_run=action == "dry")
         _pause_if_tty()
 
