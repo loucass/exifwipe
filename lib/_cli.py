@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Optional
 
 from lib._color import c_err, c_ok, c_warn, set_color
-from lib._config import DEFAULT_MAX_PIXELS, IMAGE_FORMATS, RAW_FORMATS, R_ERR, R_OK, __version__
-from lib._driver import _sniff_format, handle_one, iter_inputs
-from lib._inspect import exiftool_hint, inspect_image
+from lib._config import DEFAULT_MAX_PIXELS, R_ERR, R_OK, __version__
+from lib._driver import handle_one, iter_inputs
+from lib._inspect import exiftool_hint
 from lib._menu import run_interactive_menu
 from lib._verify import print_formats_matrix, verify_clean
 
@@ -34,8 +34,9 @@ def build_parser() -> argparse.ArgumentParser:
             "examples:\n"
             "  exifwipe photo.jpg                       # strip in place\n"
             "  exifwipe ./images/ -o ./clean/           # batch to new folder\n"
-            "  exifwipe photo.jpg --inspect             # preview what exiftool sees\n"
-            "  exifwipe photo.jpg --dry-run -v          # verbose inspect, no writes\n"
+            "  exifwipe photo.jpg --inspect             # recursive metadata dump, no writes\n"
+            "  exifwipe photo.jpg --inspect --full      # same, without paging\n"
+            "  exifwipe photo.jpg --dry-run             # summary only, no writes\n"
             "\n"
             "aliases I keep in my shell:\n"
             "  alias sc=exifwipe ~/Pictures/Screenshots/*.png\n"
@@ -53,6 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="inspect what would be stripped, write nothing")
     p.add_argument("--inspect", action="store_true",
                    help="print metadata exiftool-style and exit (no write)")
+    p.add_argument("--full", action="store_true",
+                   help="with --inspect, print everything without paging")
     p.add_argument("--verify", action="store_true",
                    help="after stripping, prove no metadata remains "
                         "(exiftool if installed, else per-format parsers); "
@@ -116,30 +119,15 @@ def main(argv: Optional[list] = None) -> int:
 
     # --inspect is a read-only mode
     if args.inspect:
-        n_err = 0
+        n_ok = n_err = n_skip = 0
         for p in targets:
-            try:
-                fmt = _sniff_format(p) if p.is_file() else None
-                if fmt in IMAGE_FORMATS:
-                    inspect_image(p, max_pixels=args.max_pixels)
-                elif fmt in RAW_FORMATS:
-                    st = p.stat()
-                    print(f"\n=== {p.name} ===")
-                    print(f"  RAW {fmt.upper()}: {st.st_size:,} bytes, "
-                          "TIFF-family container — `exiftool -a -G1 FILE` "
-                          "sees what surgery would remove")
-                elif fmt == "raf":
-                    st = p.stat()
-                    print(f"\n=== {p.name} ===")
-                    print(f"  Fuji RAF: {st.st_size:,} bytes — header "
-                          "model/serial + embedded JPEG EXIF + FujiIFD "
-                          "block (surgery would remove all of it)")
-                elif fmt == "pdf":
-                    print(f"\n=== {p.name} ===")
-                    print("  (PDF — use pikepdf or `exiftool -all=` to inspect)")
-            except Exception as e:
-                print(f"  {c_err('[ERR]')} {c_warn(p.name)}: {e}", file=sys.stderr)
+            res = handle_one(p, args)
+            if res == R_OK:
+                n_ok += 1
+            elif res == R_ERR:
                 n_err += 1
+            else:
+                n_skip += 1
         print("\n-- exiftool reference --\n" + exiftool_hint())
         return 0 if n_err == 0 else 3
 

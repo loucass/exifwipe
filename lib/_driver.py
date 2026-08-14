@@ -318,6 +318,20 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
     downloaded JPEG with no extension is still stripped. Unrecognized
     files are SKIPPED (never counted as errors)."""
     fmt = _sniff_format(path) if path.is_file() else None
+
+    # --inspect is a read-only deep dump for EVERY format (not just the
+    # pixel-rebuilt images): the same IFD/chunk machinery the strip
+    # engine uses, shown file by file, with anomaly flags and paging.
+    if getattr(args, "inspect", False):
+        try:
+            inspect_image(path, max_pixels=getattr(args, "max_pixels", None),
+                          full=getattr(args, "full", False))
+        except Exception as e:
+            print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}",
+                  file=sys.stderr)
+            return R_ERR
+        return R_OK
+
     if fmt is None:
         if args.verbose:
             print(f"  {c_dim('[skip] unrecognized:')} {path.name}")
@@ -335,7 +349,7 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
         report = (_inventory_metadata(path.read_bytes(), "raf",
                                       args.keep_icc)
                   if want_report else None)
-        if args.dry_run or args.inspect:
+        if args.dry_run:
             try:
                 st = path.stat()
                 print(f"  {c_info('RAF')} {c_head(path.name)}: {st.st_size:,} "
@@ -370,7 +384,7 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
         report = (_inventory_metadata(path.read_bytes(), fmt, args.keep_icc,
                                       drop_orientation)
                   if want_report else None)
-        if args.dry_run or args.inspect:
+        if args.dry_run:
             try:
                 st = path.stat()
                 print(f"  {c_info(fmt.upper())} {c_head(path.name)}: "
@@ -400,18 +414,19 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
 
     if fmt in IMAGE_FORMATS:
         report = [] if want_report else None
-        if args.dry_run or args.inspect:
-            if want_report:
-                try:
+        if args.dry_run:
+            try:
+                st = path.stat()
+                print(f"  {c_info(fmt.upper())} {c_head(path.name)}: "
+                      f"{st.st_size:,} bytes — surgery would rebuild the "
+                      "pixels and strip all metadata losslessly")
+                if want_report:
                     _print_report(path, _inventory_metadata(
                         path.read_bytes(), fmt, args.keep_icc,
                         drop_orientation))
-                except OSError:
-                    pass
-            try:
-                inspect_image(path, max_pixels=getattr(args, "max_pixels", None))
-            except Exception as e:
-                print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}", file=sys.stderr)
+            except OSError as e:
+                print(f"  {c_err('[ERR]')} {c_warn(path.name)}: {e}",
+                      file=sys.stderr)
                 return R_ERR
             return R_OK
         try:
@@ -437,7 +452,7 @@ def handle_one(path: Path, args: argparse.Namespace) -> int:
         return R_OK
 
     if fmt == "pdf":
-        if args.dry_run or args.inspect:
+        if args.dry_run:
             print(f"  {c_dim('(would strip PDF metadata)')} {path.name}")
             return R_OK
         cleaned = strip_pdf_bytes(path)

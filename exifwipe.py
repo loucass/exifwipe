@@ -27,9 +27,9 @@ import lib._driver as _driver
 import lib._menu as _menu
 import lib._cli as _cli
 
-from lib._color import _c, _can_color, c_blue, c_dim, c_err, c_head, c_info, c_mag, c_ok, c_warn, set_color
+from lib._color import _c, _can_color, c_blue, c_danger, c_dim, c_err, c_head, c_info, c_mag, c_ok, c_warn, set_color
 from lib._config import DEFAULT_MAX_PIXELS, DOC_EXTS, IMAGE_EXTS, IMAGE_FORMATS, RASTER_FORMATS, RAW_EXTENSIONS, RAW_FORMATS, R_ERR, R_OK, R_SKIP, SUPPORTED_FORMATS
-from lib._inspect import exiftool_hint, inspect_image
+from lib._inspect import _Pager, _anomalies, _decode_ascii, _format_value, _img_info_value, _inspect_gif, _inspect_heif, _inspect_jpeg, _inspect_pdf, _inspect_png, _inspect_raf, _inspect_webp, _size_str, _tag_name, _walk_tiff, exiftool_hint, inspect_image
 from lib._verify import _parse_exiftool_json, _verify_bytes, _verify_with_exiftool, print_formats_matrix, verify_clean
 from lib._tiff import _is_tiff_family, _iter_tiff_entries, _overlaps_protected, _tiff_find_identifying, _tiff_has_tag, _tiff_inventory, _tiff_layout, _tiff_parse_header, _tiff_protected_regions, _tiff_strip_lossless, _tiff_structure_ok, _tiff_value_bytes, _tiff_vendor_from_makernote, _value_is_blank
 from lib._pixels import _apply_orientation, _perturb_image, _perturb_seed, _rebuild_frame, _strip_multiframe
